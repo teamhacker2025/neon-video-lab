@@ -1,37 +1,59 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, Link } from "@tanstack/react-router";
+import { useServerFn } from "@tanstack/react-start";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { FFmpeg } from "@ffmpeg/ffmpeg";
-import { fetchFile, toBlobURL } from "@ffmpeg/util";
+import {
+  abortEnhance,
+  checkCopyright,
+  pollEnhance,
+  startEnhance,
+  verifyEnhancement,
+} from "@/server/enhance.functions";
 
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
-      { title: "NEONUPSCALE — AI Video Enhancer up to 10K" },
-      { name: "description", content: "Free in-browser AI video enhancer. Upscale to 4K, 8K, even 10K with denoise, Lanczos, sharpen, and color-grade. 100% client-side via ffmpeg.wasm." },
+      { title: "NEONUPSCALE — Real AI Video Enhancer (Real-ESRGAN GPU)" },
+      {
+        name: "description",
+        content:
+          "Super-fast AI video enhancement powered by Real-ESRGAN on GPU. Up to 4× upscale, RIFE FPS interpolation, anti-piracy filter, and Gemini quality auditor — real enhancement, not fake resolution.",
+      },
+      { property: "og:title", content: "NEONUPSCALE — Real GPU AI Video Enhancer" },
+      {
+        property: "og:description",
+        content: "Real-ESRGAN 4× upscale + RIFE FPS boost + AI quality watchdog. ~30-60s per minute of video.",
+      },
     ],
   }),
   component: Index,
 });
 
-type Step = "idle" | "uploading" | "analyzing" | "enhancing" | "rendering" | "finalizing" | "done" | "error";
+type Step =
+  | "idle"
+  | "scanning" // anti-piracy AI scan
+  | "uploading" // sending to server
+  | "queued" // Replicate queued
+  | "enhancing" // GPU running
+  | "auditing" // verify watchdog
+  | "done"
+  | "error";
 
 const STEPS: { id: Exclude<Step, "idle" | "done" | "error">; label: string }[] = [
+  { id: "scanning", label: "AI Safety Scan" },
   { id: "uploading", label: "Uploading" },
-  { id: "analyzing", label: "Analyzing" },
-  { id: "enhancing", label: "Enhancing" },
-  { id: "rendering", label: "Rendering" },
-  { id: "finalizing", label: "Finalizing" },
+  { id: "queued", label: "Queued" },
+  { id: "enhancing", label: "GPU Enhancing" },
+  { id: "auditing", label: "AI Audit" },
 ];
 
-const RES_OPTIONS = [
-  { id: "1080p", label: "1080p Full HD", w: 1920, h: 1080 },
-  { id: "1440p", label: "1440p QHD", w: 2560, h: 1440 },
-  { id: "2160p", label: "4K Ultra HD", w: 3840, h: 2160 },
-  { id: "4320p", label: "8K Ultra HD", w: 7680, h: 4320 },
-  { id: "10k", label: "10K Cinema", w: 10240, h: 5760 },
+const SCALE_OPTIONS = [
+  { id: 2, label: "2× HD+", subtitle: "Fast (~20-40s)" },
+  { id: 4, label: "4× Ultra", subtitle: "Best quality (~30-60s)" },
 ] as const;
 
-const MAX_PROCESS_MS = 10 * 60 * 1000;
+const MAX_FILE_MB = 60; // safe inline upload size for Replicate data URI
+const MAX_PROCESS_MS = 8 * 60 * 1000; // 8-min server-side cap
+const POLL_MS = 1500;
 
 function classNames(...s: (string | false | null | undefined)[]) {
   return s.filter(Boolean).join(" ");
@@ -50,112 +72,124 @@ function fmtTime(ms: number) {
   return `${m}:${String(s % 60).padStart(2, "0")}`;
 }
 
-function Index() {
-  const [mounted, setMounted] = useState(false);
-  const [isolated, setIsolated] = useState<boolean | null>(null);
-  const [ffmpegReady, setFfmpegReady] = useState(false);
-  const [loadingCore, setLoadingCore] = useState(false);
-  const [coreError, setCoreError] = useState<string | null>(null);
+// Read a File and return a "data:video/...;base64,..." URL via FileReader (no full base64 in JS land).
+function fileToDataURL(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error("File read failed"));
+    reader.onload = () => resolve(reader.result as string);
+    reader.readAsDataURL(file);
+  });
+}
 
-  const ffmpegRef = useRef<FFmpeg | null>(null);
-  const loadPromiseRef = useRef<Promise<FFmpeg> | null>(null);
-  const startTsRef = useRef<number>(0);
-  const tickRef = useRef<number | null>(null);
+// Sample one frame from a video file at a given time and return a JPEG data URL.
+async function sampleFrameAt(file: File, atSec: number, maxW = 640): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const v = document.createElement("video");
+    v.preload = "auto";
+    v.muted = true;
+    v.crossOrigin = "anonymous";
+    v.src = url;
+    v.onloadedmetadata = () => {
+      const t = Math.min(Math.max(0.1, atSec), Math.max(0.1, (v.duration || 1) - 0.1));
+      v.currentTime = t;
+    };
+    v.onseeked = () => {
+      try {
+        const ratio = (v.videoHeight || 360) / (v.videoWidth || 640);
+        const w = Math.min(maxW, v.videoWidth || maxW);
+        const h = Math.round(w * ratio);
+        const c = document.createElement("canvas");
+        c.width = w;
+        c.height = h;
+        const ctx = c.getContext("2d");
+        if (!ctx) throw new Error("Canvas 2D context unavailable");
+        ctx.drawImage(v, 0, 0, w, h);
+        const data = c.toDataURL("image/jpeg", 0.82);
+        URL.revokeObjectURL(url);
+        resolve(data);
+      } catch (e) {
+        URL.revokeObjectURL(url);
+        reject(e);
+      }
+    };
+    v.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("Could not decode video for frame sampling"));
+    };
+  });
+}
+
+// Sample one frame from a remote video URL.
+async function sampleFrameFromUrl(url: string, atSec: number, maxW = 640): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const v = document.createElement("video");
+    v.preload = "auto";
+    v.muted = true;
+    v.crossOrigin = "anonymous";
+    v.src = url;
+    v.onloadedmetadata = () => {
+      const t = Math.min(Math.max(0.1, atSec), Math.max(0.1, (v.duration || 1) - 0.1));
+      v.currentTime = t;
+    };
+    v.onseeked = () => {
+      try {
+        const ratio = (v.videoHeight || 360) / (v.videoWidth || 640);
+        const w = Math.min(maxW, v.videoWidth || maxW);
+        const h = Math.round(w * ratio);
+        const c = document.createElement("canvas");
+        c.width = w;
+        c.height = h;
+        const ctx = c.getContext("2d");
+        if (!ctx) throw new Error("Canvas 2D context unavailable");
+        ctx.drawImage(v, 0, 0, w, h);
+        resolve(c.toDataURL("image/jpeg", 0.82));
+      } catch (e) {
+        reject(e);
+      }
+    };
+    v.onerror = () => reject(new Error("Could not decode remote video for audit"));
+  });
+}
+
+function Index() {
+  const startEnhanceFn = useServerFn(startEnhance);
+  const pollEnhanceFn = useServerFn(pollEnhance);
+  const abortEnhanceFn = useServerFn(abortEnhance);
+  const checkCopyrightFn = useServerFn(checkCopyright);
+  const verifyEnhancementFn = useServerFn(verifyEnhancement);
 
   const [file, setFile] = useState<File | null>(null);
   const [inputUrl, setInputUrl] = useState<string | null>(null);
   const [outputUrl, setOutputUrl] = useState<string | null>(null);
   const [step, setStep] = useState<Step>("idle");
-  const [progress, setProgress] = useState(0); // 0..100
-  const [logLine, setLogLine] = useState("");
+  const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
+  const [statusLine, setStatusLine] = useState("");
 
-  const [resolution, setResolution] = useState<typeof RES_OPTIONS[number]["id"]>("2160p");
-  const [sharpen, setSharpen] = useState(true);
-  const [colorGrade, setColorGrade] = useState(true);
-  const [ytOptimize, setYtOptimize] = useState(true);
+  const [scale, setScale] = useState<2 | 4>(4);
+  const [faceEnhance, setFaceEnhance] = useState(true);
+  const [acceptedTerms, setAcceptedTerms] = useState(false);
+
+  const [audit, setAudit] = useState<null | {
+    real_enhancement: boolean;
+    sharpness_gain: number;
+    detail_gain: number;
+    noise_reduction: number;
+    verdict: string;
+  }>(null);
+  const [piracyWarn, setPiracyWarn] = useState<string | null>(null);
 
   const [sliderPos, setSliderPos] = useState(50);
   const beforeRef = useRef<HTMLVideoElement | null>(null);
   const afterRef = useRef<HTMLVideoElement | null>(null);
 
-  useEffect(() => {
-    setMounted(true);
-    setIsolated(typeof window !== "undefined" && (window as { crossOriginIsolated?: boolean }).crossOriginIsolated === true);
-  }, []);
-
-  // Load ffmpeg core lazily on first interaction.
-  // Picks multi-threaded core-mt when crossOriginIsolated (SharedArrayBuffer available),
-  // otherwise falls back to single-threaded core so it works on ANY host
-  // (GitHub Pages, plain Vercel, etc.) — no SharedArrayBuffer required.
-  const loadFfmpeg = useCallback(async () => {
-    if (ffmpegRef.current && ffmpegReady) return ffmpegRef.current;
-    if (loadPromiseRef.current) return loadPromiseRef.current;
-
-    setLoadingCore(true);
-    setCoreError(null);
-
-    const promise = (async () => {
-      const ffmpeg = new FFmpeg();
-      ffmpeg.on("log", ({ message }) => setLogLine(message));
-      ffmpeg.on("progress", ({ progress: p }) => {
-        const pct = Math.max(0, Math.min(1, p)) * 100;
-        setProgress(25 + pct * 0.7);
-      });
-
-      const hasSAB =
-        typeof SharedArrayBuffer !== "undefined" &&
-        (window as { crossOriginIsolated?: boolean }).crossOriginIsolated === true;
-
-      const mtBase = "https://unpkg.com/@ffmpeg/core-mt@0.12.6/dist/esm";
-      const stBase = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm";
-
-      try {
-        if (hasSAB) {
-          await ffmpeg.load({
-            coreURL: await toBlobURL(`${mtBase}/ffmpeg-core.js`, "text/javascript"),
-            wasmURL: await toBlobURL(`${mtBase}/ffmpeg-core.wasm`, "application/wasm"),
-            workerURL: await toBlobURL(`${mtBase}/ffmpeg-core.worker.js`, "text/javascript"),
-          });
-        } else {
-          await ffmpeg.load({
-            coreURL: await toBlobURL(`${stBase}/ffmpeg-core.js`, "text/javascript"),
-            wasmURL: await toBlobURL(`${stBase}/ffmpeg-core.wasm`, "application/wasm"),
-          });
-        }
-      } catch (err) {
-        // Fallback: try single-threaded if MT failed
-        if (hasSAB) {
-          await ffmpeg.load({
-            coreURL: await toBlobURL(`${stBase}/ffmpeg-core.js`, "text/javascript"),
-            wasmURL: await toBlobURL(`${stBase}/ffmpeg-core.wasm`, "application/wasm"),
-          });
-        } else {
-          throw err;
-        }
-      }
-
-      ffmpegRef.current = ffmpeg;
-      setFfmpegReady(true);
-      return ffmpeg;
-    })();
-
-    loadPromiseRef.current = promise;
-
-    try {
-      const result = await promise;
-      return result;
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setCoreError(msg);
-      loadPromiseRef.current = null;
-      ffmpegRef.current = null;
-      throw e;
-    } finally {
-      setLoadingCore(false);
-    }
-  }, [ffmpegReady]);
+  const startTsRef = useRef<number>(0);
+  const tickRef = useRef<number | null>(null);
+  const predIdRef = useRef<string | null>(null);
+  const cancelledRef = useRef(false);
 
   const onPickFile = (f: File | null) => {
     if (!f) return;
@@ -163,10 +197,16 @@ function Index() {
       setError("Please select a valid video file.");
       return;
     }
+    if (f.size > MAX_FILE_MB * 1024 * 1024) {
+      setError(`File too large (${fmtBytes(f.size)}). Max ${MAX_FILE_MB} MB for direct AI processing.`);
+      return;
+    }
     setError(null);
     setOutputUrl(null);
     setProgress(0);
     setStep("idle");
+    setAudit(null);
+    setPiracyWarn(null);
     setFile(f);
     if (inputUrl) URL.revokeObjectURL(inputUrl);
     setInputUrl(URL.createObjectURL(f));
@@ -178,24 +218,6 @@ function Index() {
     if (f) onPickFile(f);
   };
 
-  const buildVf = () => {
-    const r = RES_OPTIONS.find((x) => x.id === resolution)!;
-    // Multi-stage AI-style enhancement chain:
-    //  1. Mild denoise to remove compression noise before scaling
-    //  2. Two-pass Lanczos upscale for cleaner edges at extreme ratios
-    //  3. Pad to target with even dims
-    //  4. Unsharp mask + EQ
-    const filters: string[] = [
-      `hqdn3d=1.5:1.5:6:6`,
-      `scale=w=${r.w}:h=${r.h}:force_original_aspect_ratio=decrease:flags=lanczos+accurate_rnd+full_chroma_int`,
-      `pad=${r.w}:${r.h}:(ow-iw)/2:(oh-ih)/2:color=black`,
-    ];
-    if (sharpen) filters.push(`unsharp=7:7:1.4:7:7:0.2`);
-    if (colorGrade) filters.push(`eq=contrast=1.12:saturation=1.35:gamma=1.02`);
-    if (ytOptimize) filters.push(`format=yuv420p`);
-    return filters.join(",");
-  };
-
   const cleanup = () => {
     if (tickRef.current) {
       window.clearInterval(tickRef.current);
@@ -203,83 +225,134 @@ function Index() {
     }
   };
 
+  const cancel = useCallback(async () => {
+    cancelledRef.current = true;
+    if (predIdRef.current) {
+      try {
+        await abortEnhanceFn({ data: { id: predIdRef.current } });
+      } catch {
+        /* noop */
+      }
+    }
+    cleanup();
+    setStep("idle");
+    setProgress(0);
+    setStatusLine("Cancelled");
+  }, [abortEnhanceFn]);
+
   const enhance = async () => {
     if (!file) return;
+    if (!acceptedTerms) {
+      setError("Please accept the Terms & Copyright policy to continue.");
+      return;
+    }
     setError(null);
     setOutputUrl(null);
+    setAudit(null);
+    setPiracyWarn(null);
     setProgress(0);
-    setStep("uploading");
     setElapsed(0);
+    cancelledRef.current = false;
+    predIdRef.current = null;
+
+    startTsRef.current = performance.now();
+    tickRef.current = window.setInterval(() => {
+      const e = performance.now() - startTsRef.current;
+      setElapsed(e);
+      if (e > MAX_PROCESS_MS) {
+        cancel();
+        setStep("error");
+        setError("Processing exceeded the 8-minute limit. Try a shorter clip or 2× scale.");
+      }
+    }, 250);
 
     try {
-      // CRITICAL: load ffmpeg BEFORE starting timer / using it.
-      // Prevents "ffmpeg is not loaded, call await ffmpeg.load() first" race.
-      setProgress(2);
-      const ffmpeg = await loadFfmpeg();
-      if (!ffmpeg) throw new Error("FFmpeg engine failed to initialize.");
+      // 1) Anti-piracy AI scan on first usable frame
+      setStep("scanning");
+      setStatusLine("Sampling frame for safety check…");
+      setProgress(4);
+      const beforeFrame = await sampleFrameAt(file, 1.0).catch(() => sampleFrameAt(file, 0.2));
+      setProgress(8);
+      const verdict = await checkCopyrightFn({ data: { imageDataUrl: beforeFrame } });
+      if (cancelledRef.current) return;
+      if (verdict.verdict === "block") {
+        cleanup();
+        setStep("error");
+        setError(
+          `Upload blocked by anti-piracy AI: ${verdict.reason || "looks like copyrighted material."} If this is a mistake and you own the rights, see our Copyright policy.`,
+        );
+        return;
+      }
+      if (verdict.verdict === "warn") {
+        setPiracyWarn(verdict.reason || "AI flagged this as possibly copyrighted — proceeding under your declared ownership.");
+      }
+      setProgress(14);
 
-      startTsRef.current = performance.now();
-      tickRef.current = window.setInterval(() => {
-        const e = performance.now() - startTsRef.current;
-        setElapsed(e);
-        if (e > MAX_PROCESS_MS) {
-          try { ffmpegRef.current?.terminate(); } catch { /* noop */ }
-          cleanup();
-          setStep("error");
-          setError("Processing exceeded the 10-minute limit. Try a shorter clip or lower resolution.");
-        }
-      }, 250);
-
+      // 2) Encode to data URL & send to server
       setStep("uploading");
-      setProgress(5);
-      const inputName = "input." + (file.name.split(".").pop() || "mp4");
-      const outputName = "output.mp4";
-      await ffmpeg.writeFile(inputName, await fetchFile(file));
-      setProgress(15);
-
-      setStep("analyzing");
+      setStatusLine("Encoding & uploading to GPU…");
+      const dataUrl = await fileToDataURL(file);
+      if (cancelledRef.current) return;
       setProgress(22);
-      await new Promise((r) => setTimeout(r, 300));
 
-      setStep("enhancing");
-      const vf = buildVf();
-      const args = [
-        "-i", inputName,
-        "-vf", vf,
-        "-c:v", "libx264",
-        "-preset", "superfast",
-        "-tune", "film",
-        "-crf", "20",
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        outputName,
-      ];
-      await ffmpeg.exec(args);
+      const created = await startEnhanceFn({
+        data: { videoDataUrl: dataUrl, scale, faceEnhance },
+      });
+      if (cancelledRef.current) return;
+      predIdRef.current = created.id;
+      setStatusLine(`Prediction ${created.id.slice(0, 8)} queued`);
+      setProgress(28);
 
-      setStep("rendering");
-      setProgress(96);
-      const data = await ffmpeg.readFile(outputName);
-      const bytes = data instanceof Uint8Array ? data : new TextEncoder().encode(String(data));
-      const buf = new Uint8Array(bytes.byteLength);
-      buf.set(bytes);
-      const blob = new Blob([buf.buffer as ArrayBuffer], { type: "video/mp4" });
+      // 3) Poll
+      setStep("queued");
+      let lastStatus = created.status;
+      let pollProgress = 30;
+      while (true) {
+        if (cancelledRef.current) return;
+        const p = await pollEnhanceFn({ data: { id: created.id } });
+        lastStatus = p.status;
+        setStatusLine(`GPU ${p.status}…`);
 
-      setStep("finalizing");
-      setProgress(99);
-      const url = URL.createObjectURL(blob);
-      setOutputUrl(url);
-      setProgress(100);
-      setStep("done");
+        if (p.status === "processing") setStep("enhancing");
 
-      try { await ffmpeg.deleteFile(inputName); } catch { /* noop */ }
-      try { await ffmpeg.deleteFile(outputName); } catch { /* noop */ }
+        // Smooth fake-progress bar (real % isn't reported by Replicate for video)
+        pollProgress = Math.min(85, pollProgress + 1.2);
+        setProgress(pollProgress);
+
+        if (p.status === "succeeded") {
+          const out = Array.isArray(p.output) ? p.output[0] : p.output;
+          if (!out || typeof out !== "string") throw new Error("Replicate returned no output URL.");
+          setProgress(88);
+
+          // 4) AI quality audit — sample frame from output and compare
+          setStep("auditing");
+          setStatusLine("AI auditing real enhancement…");
+          try {
+            const afterFrame = await sampleFrameFromUrl(out, 1.0);
+            const a = await verifyEnhancementFn({
+              data: { beforeDataUrl: beforeFrame, afterDataUrl: afterFrame },
+            });
+            setAudit(a);
+          } catch {
+            // non-fatal
+          }
+
+          setOutputUrl(out);
+          setProgress(100);
+          setStep("done");
+          cleanup();
+          return;
+        }
+        if (p.status === "failed" || p.status === "canceled") {
+          throw new Error(p.error || `Replicate ${p.status}`);
+        }
+        await new Promise((r) => setTimeout(r, POLL_MS));
+      }
     } catch (e) {
+      if (cancelledRef.current) return;
       const msg = e instanceof Error ? e.message : String(e);
       setError(msg || "Processing failed.");
       setStep("error");
-    } finally {
       cleanup();
     }
   };
@@ -287,18 +360,28 @@ function Index() {
   const reset = () => {
     cleanup();
     if (inputUrl) URL.revokeObjectURL(inputUrl);
-    if (outputUrl) URL.revokeObjectURL(outputUrl);
-    setFile(null); setInputUrl(null); setOutputUrl(null);
-    setStep("idle"); setProgress(0); setError(null); setElapsed(0); setLogLine("");
+    setFile(null);
+    setInputUrl(null);
+    setOutputUrl(null);
+    setStep("idle");
+    setProgress(0);
+    setError(null);
+    setElapsed(0);
+    setStatusLine("");
+    setAudit(null);
+    setPiracyWarn(null);
   };
 
-  // Sync video playback for before/after
+  // Sync before/after playback for slider compare
   useEffect(() => {
-    const a = beforeRef.current, b = afterRef.current;
+    const a = beforeRef.current;
+    const b = afterRef.current;
     if (!a || !b) return;
-    const sync = () => { if (Math.abs(a.currentTime - b.currentTime) > 0.1) b.currentTime = a.currentTime; };
-    const play = () => { b.play().catch(() => {}); };
-    const pause = () => { b.pause(); };
+    const sync = () => {
+      if (Math.abs(a.currentTime - b.currentTime) > 0.1) b.currentTime = a.currentTime;
+    };
+    const play = () => b.play().catch(() => {});
+    const pause = () => b.pause();
     a.addEventListener("timeupdate", sync);
     a.addEventListener("play", play);
     a.addEventListener("pause", pause);
@@ -322,7 +405,6 @@ function Index() {
 
   return (
     <div className="relative min-h-screen text-foreground">
-      {/* Decorative grid */}
       <div className="pointer-events-none absolute inset-0 grid-bg opacity-30" />
       <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-[#ff0050]/60 to-transparent" />
 
@@ -333,21 +415,21 @@ function Index() {
             <span className="font-display text-base neon-text">N</span>
           </div>
           <div className="leading-tight">
-            <div className="font-display text-lg tracking-widest">NEON<span className="neon-text">UPSCALE</span></div>
-            <div className="text-[10px] uppercase tracking-[0.25em] text-muted-foreground">AI Video Enhancer</div>
+            <div className="font-display text-lg tracking-widest">
+              NEON<span className="neon-text">UPSCALE</span>
+            </div>
+            <div className="text-[10px] uppercase tracking-[0.25em] text-muted-foreground">Real AI Video Enhancer</div>
           </div>
         </div>
-        <nav className="hidden items-center gap-7 text-sm text-muted-foreground md:flex">
+        <nav className="hidden items-center gap-6 text-sm text-muted-foreground md:flex">
           <a href="#features" className="hover:text-foreground">Features</a>
           <a href="#how" className="hover:text-foreground">How it works</a>
-          <a href="#faq" className="hover:text-foreground">FAQ</a>
+          <Link to="/privacy" className="hover:text-foreground">Privacy</Link>
+          <Link to="/terms" className="hover:text-foreground">Terms</Link>
         </nav>
         <div className="hidden md:block">
-          <span className={classNames(
-            "rounded-full px-3 py-1 text-[11px] uppercase tracking-widest",
-            isolated ? "bg-[#ff0050]/15 text-[#ff7aa3] neon-border" : "bg-yellow-500/10 text-yellow-300"
-          )}>
-            {isolated === null ? "…" : isolated ? "Secure Engine" : "Headers Missing"}
+          <span className="rounded-full px-3 py-1 text-[11px] uppercase tracking-widest bg-[#ff0050]/15 text-[#ff7aa3] neon-border">
+            Real-ESRGAN GPU
           </span>
         </div>
       </header>
@@ -357,14 +439,13 @@ function Index() {
         <div className="mx-auto max-w-3xl text-center">
           <div className="mx-auto mb-5 inline-flex items-center gap-2 rounded-full border border-[#ff0050]/30 bg-[#ff0050]/10 px-3 py-1 text-xs uppercase tracking-[0.25em] text-[#ff7aa3]">
             <span className="h-1.5 w-1.5 rounded-full bg-[#ff0050] pulse-neon" />
-            100% In-Browser · No Upload to Server
+            Real GPU AI · Not Fake Upscale
           </div>
           <h1 className="font-display text-4xl leading-tight md:text-6xl">
-            Enhance Videos to <span className="neon-text">Cinematic 4K</span>
+            Enhance Videos with <span className="neon-text">Real AI</span> in Seconds
           </h1>
           <p className="mx-auto mt-5 max-w-2xl text-sm text-muted-foreground md:text-base">
-            Lanczos upscale · Unsharp mask · Auto color grading · YouTube-ready encode.
-            Powered by <span className="text-foreground">ffmpeg.wasm</span> running entirely on your device.
+            Real-ESRGAN GPU upscaling · Optional face restore · Anti-piracy filter · Gemini quality auditor that verifies actual detail gain — not just stretched pixels.
           </p>
         </div>
       </section>
@@ -379,28 +460,33 @@ function Index() {
               const done = i < stepIndex || step === "done";
               return (
                 <li key={s.id} className="flex flex-col items-center gap-2">
-                  <div className={classNames(
-                    "flex h-9 w-9 items-center justify-center rounded-full border text-xs font-semibold transition-all",
-                    done && "border-[#ff0050] bg-[#ff0050] text-white",
-                    active && "border-[#ff0050] text-[#ff0050] pulse-neon",
-                    !done && !active && "border-white/15 text-muted-foreground"
-                  )}>
+                  <div
+                    className={classNames(
+                      "flex h-9 w-9 items-center justify-center rounded-full border text-xs font-semibold transition-all",
+                      done && "border-[#ff0050] bg-[#ff0050] text-white",
+                      active && "border-[#ff0050] text-[#ff0050] pulse-neon",
+                      !done && !active && "border-white/15 text-muted-foreground",
+                    )}
+                  >
                     {done ? "✓" : i + 1}
                   </div>
-                  <span className={classNames(
-                    "text-[10px] uppercase tracking-[0.18em] md:text-xs",
-                    (active || done) ? "text-foreground" : "text-muted-foreground"
-                  )}>
+                  <span
+                    className={classNames(
+                      "text-center text-[10px] uppercase tracking-[0.18em] md:text-xs",
+                      (active || done) ? "text-foreground" : "text-muted-foreground",
+                    )}
+                  >
                     {s.label}
                   </span>
                 </li>
               );
             })}
-            {/* connector */}
             <div className="pointer-events-none absolute left-[10%] right-[10%] top-[18px] -z-0 h-px bg-white/10">
               <div
                 className="h-full bg-gradient-to-r from-[#ff0050] to-[#ff5c8a] transition-all duration-500"
-                style={{ width: `${Math.max(0, Math.min(100, ((stepIndex < 0 ? 0 : stepIndex) / (STEPS.length - 1)) * 100))}%` }}
+                style={{
+                  width: `${Math.max(0, Math.min(100, ((stepIndex < 0 ? 0 : stepIndex) / (STEPS.length - 1)) * 100))}%`,
+                }}
               />
             </div>
           </ol>
@@ -421,29 +507,32 @@ function Index() {
                     onChange={(e) => onPickFile(e.target.files?.[0] ?? null)}
                   />
                   <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-[#ff0050]/10 neon-border">
-                    <svg viewBox="0 0 24 24" fill="none" className="h-7 w-7 text-[#ff0050]" stroke="currentColor" strokeWidth="2">
+                    <svg viewBox="0 0 24 24" fill="none" className="h-7 w-7 text-[#ff0050]" stroke="currentColor" strokeWidth={2}>
                       <path strokeLinecap="round" strokeLinejoin="round" d="M12 16V4m0 0l-4 4m4-4l4 4M4 20h16" />
                     </svg>
                   </div>
                   <div className="font-display text-lg">Drop your video here</div>
-                  <div className="mt-1 text-sm text-muted-foreground">or click to browse · MP4, MOV, WebM, MKV</div>
+                  <div className="mt-1 text-sm text-muted-foreground">or click to browse · MP4, MOV, WebM</div>
                   <div className="mt-6 text-[11px] uppercase tracking-[0.2em] text-muted-foreground">
-                    Recommended: clips under 60 seconds
+                    Max {MAX_FILE_MB} MB · Recommended ≤ 60 sec
                   </div>
                 </label>
               )}
 
               {file && !outputUrl && (
                 <div className="overflow-hidden rounded-xl border border-white/10 bg-black">
-                  {inputUrl && (
-                    <video src={inputUrl} controls className="aspect-video w-full bg-black" />
-                  )}
+                  {inputUrl && <video src={inputUrl} controls className="aspect-video w-full bg-black" />}
                   <div className="flex flex-wrap items-center justify-between gap-3 p-4">
                     <div className="text-sm">
                       <div className="font-medium text-foreground">{file.name}</div>
-                      <div className="text-xs text-muted-foreground">{fmtBytes(file.size)} · {file.type || "video"}</div>
+                      <div className="text-xs text-muted-foreground">
+                        {fmtBytes(file.size)} · {file.type || "video"}
+                      </div>
                     </div>
-                    <button onClick={reset} className="rounded-md border border-white/15 px-3 py-1.5 text-xs uppercase tracking-widest text-muted-foreground hover:text-foreground hover:border-white/30">
+                    <button
+                      onClick={reset}
+                      className="rounded-md border border-white/15 px-3 py-1.5 text-xs uppercase tracking-widest text-muted-foreground hover:text-foreground hover:border-white/30"
+                    >
                       Change
                     </button>
                   </div>
@@ -472,19 +561,27 @@ function Index() {
                     <div className="absolute right-3 top-3 rounded bg-[#ff0050]/80 px-2 py-1 text-[10px] uppercase tracking-widest text-white">After</div>
                   </div>
                   <input
-                    type="range" min={0} max={100} value={sliderPos}
+                    type="range"
+                    min={0}
+                    max={100}
+                    value={sliderPos}
                     onChange={(e) => setSliderPos(parseInt(e.target.value))}
                     className="w-full accent-[#ff0050]"
                   />
                   <div className="flex flex-wrap gap-3">
                     <a
                       href={outputUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
                       download={`enhanced_${file?.name?.replace(/\.[^.]+$/, "") || "video"}.mp4`}
                       className="btn-neon rounded-md px-5 py-2.5 text-sm font-semibold uppercase tracking-widest"
                     >
                       Download Enhanced
                     </a>
-                    <button onClick={reset} className="rounded-md border border-white/15 px-5 py-2.5 text-sm uppercase tracking-widest hover:border-white/30">
+                    <button
+                      onClick={reset}
+                      className="rounded-md border border-white/15 px-5 py-2.5 text-sm uppercase tracking-widest hover:border-white/30"
+                    >
                       Enhance another
                     </button>
                   </div>
@@ -495,82 +592,126 @@ function Index() {
             {/* Right: settings + status */}
             <div className="space-y-5">
               <div className="glass rounded-xl p-5">
-                <div className="mb-3 text-[11px] uppercase tracking-[0.25em] text-muted-foreground">Output Resolution</div>
-                <div className="grid grid-cols-2 gap-2 md:grid-cols-3">
-                  {RES_OPTIONS.map((r) => (
+                <div className="mb-3 text-[11px] uppercase tracking-[0.25em] text-muted-foreground">Upscale Factor</div>
+                <div className="grid grid-cols-2 gap-2">
+                  {SCALE_OPTIONS.map((r) => (
                     <button
                       key={r.id}
                       disabled={isProcessing}
-                      onClick={() => setResolution(r.id)}
+                      onClick={() => setScale(r.id)}
                       className={classNames(
                         "rounded-md border px-2 py-3 text-xs font-medium transition",
-                        resolution === r.id
+                        scale === r.id
                           ? "border-[#ff0050] bg-[#ff0050]/15 text-foreground neon-border"
-                          : "border-white/10 text-muted-foreground hover:text-foreground hover:border-white/25"
+                          : "border-white/10 text-muted-foreground hover:text-foreground hover:border-white/25",
                       )}
                     >
-                      <div className="font-display text-sm">{r.id.toUpperCase()}</div>
-                      <div className="mt-0.5 text-[10px] tracking-wider">{r.w}×{r.h}</div>
+                      <div className="font-display text-base">{r.label}</div>
+                      <div className="mt-0.5 text-[10px] tracking-wider">{r.subtitle}</div>
                     </button>
                   ))}
                 </div>
                 <div className="mt-2 text-[10px] text-muted-foreground">
-                  Up to 10K (10240×5760). Extreme resolutions need a strong device & may approach the 10-min limit.
+                  Real-ESRGAN runs on a managed GPU. 4× restores the most detail; 2× is faster.
                 </div>
               </div>
 
               <div className="glass rounded-xl p-5 space-y-3">
-                <div className="text-[11px] uppercase tracking-[0.25em] text-muted-foreground">Enhancement Chain</div>
-                <Toggle label="Sharpen (unsharp 5:5:1.0)" checked={sharpen} onChange={setSharpen} disabled={isProcessing} />
-                <Toggle label="Auto color grade (contrast 1.1× · sat 1.3×)" checked={colorGrade} onChange={setColorGrade} disabled={isProcessing} />
-                <Toggle label="YouTube-optimize (yuv420p · faststart)" checked={ytOptimize} onChange={setYtOptimize} disabled={isProcessing} />
+                <div className="text-[11px] uppercase tracking-[0.25em] text-muted-foreground">Advanced</div>
+                <Toggle label="Face restoration (GFPGAN)" checked={faceEnhance} onChange={setFaceEnhance} disabled={isProcessing} />
+                <label className="flex items-start gap-3 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={acceptedTerms}
+                    onChange={(e) => setAcceptedTerms(e.target.checked)}
+                    disabled={isProcessing}
+                    className="mt-1 h-4 w-4 accent-[#ff0050]"
+                  />
+                  <span className="text-muted-foreground">
+                    I own the rights or have permission to enhance this video, and I accept the{" "}
+                    <Link to="/terms" className="text-[#ff7aa3] underline">Terms</Link> and{" "}
+                    <Link to="/copyright" className="text-[#ff7aa3] underline">Copyright</Link> policy.
+                  </span>
+                </label>
               </div>
 
-              {/* Action */}
               <div className="glass rounded-xl p-5">
                 <button
-                  disabled={!file || isProcessing || loadingCore}
+                  disabled={!file || isProcessing || !acceptedTerms}
                   onClick={enhance}
                   className="btn-neon w-full rounded-md px-5 py-3 text-sm font-bold uppercase tracking-[0.2em]"
                 >
-                  {loadingCore ? "Loading Engine…" : isProcessing ? "Processing…" : "Enhance Video"}
+                  {isProcessing ? "Processing…" : "Enhance with AI"}
                 </button>
+                {isProcessing && (
+                  <button
+                    onClick={cancel}
+                    className="mt-2 w-full rounded-md border border-white/15 px-5 py-2 text-xs uppercase tracking-widest text-muted-foreground hover:text-foreground hover:border-white/30"
+                  >
+                    Cancel
+                  </button>
+                )}
 
-                {/* Progress */}
                 <div className="mt-4">
                   <div className="mb-1 flex items-center justify-between text-[11px] uppercase tracking-widest text-muted-foreground">
-                    <span>{step === "idle" ? "Ready" : step === "done" ? "Complete" : step === "error" ? "Error" : STEPS.find((s) => s.id === step)?.label}</span>
+                    <span>
+                      {step === "idle"
+                        ? "Ready"
+                        : step === "done"
+                        ? "Complete"
+                        : step === "error"
+                        ? "Error"
+                        : STEPS.find((s) => s.id === step)?.label}
+                    </span>
                     <span className="tabular-nums text-foreground">{Math.floor(progress)}%</span>
                   </div>
                   <div className="h-2 w-full overflow-hidden rounded-full bg-white/5">
                     <div
                       className={classNames(
                         "h-full rounded-full transition-[width] duration-300",
-                        step === "error" ? "bg-red-500" : "bg-gradient-to-r from-[#ff0050] to-[#ff5c8a]"
+                        step === "error" ? "bg-red-500" : "bg-gradient-to-r from-[#ff0050] to-[#ff5c8a]",
                       )}
                       style={{ width: `${progress}%`, boxShadow: "0 0 14px rgba(255,0,80,0.6)" }}
                     />
                   </div>
                   <div className="mt-2 flex items-center justify-between text-[10px] uppercase tracking-widest text-muted-foreground">
-                    <span>Elapsed {fmtTime(elapsed)} / 10:00 limit</span>
-                    {logLine && <span className="truncate max-w-[60%] font-mono normal-case tracking-normal text-[10px] opacity-70">{logLine}</span>}
+                    <span>Elapsed {fmtTime(elapsed)} / 8:00 limit</span>
+                    {statusLine && (
+                      <span className="truncate max-w-[60%] font-mono normal-case tracking-normal text-[10px] opacity-70">{statusLine}</span>
+                    )}
                   </div>
                 </div>
 
-                {error && (
-                  <div className="mt-4 rounded-md border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-200">
-                    {error}
-                  </div>
-                )}
-                {coreError && !error && (
+                {piracyWarn && (
                   <div className="mt-4 rounded-md border border-yellow-500/30 bg-yellow-500/10 p-3 text-xs text-yellow-200">
-                    Engine failed to load: {coreError}
+                    <strong>AI notice:</strong> {piracyWarn}
                   </div>
                 )}
-                {mounted && isolated === false && (
-                  <div className="mt-4 rounded-md border border-yellow-500/30 bg-yellow-500/10 p-3 text-[11px] text-yellow-200">
-                    Single-threaded engine active (SharedArrayBuffer unavailable on this host). Processing still works — just a bit slower. For 2–4× faster encoding, deploy with COOP/COEP headers (Cloudflare Pages, Netlify, or Vercel via the included <code>vercel.json</code>).
+
+                {audit && (
+                  <div className="mt-4 rounded-md border border-[#ff0050]/30 bg-[#ff0050]/5 p-3 text-xs">
+                    <div className="mb-2 flex items-center justify-between">
+                      <span className="font-display text-foreground">AI Quality Audit</span>
+                      <span
+                        className={classNames(
+                          "rounded px-2 py-0.5 text-[10px] uppercase tracking-widest",
+                          audit.real_enhancement ? "bg-emerald-500/20 text-emerald-300" : "bg-yellow-500/20 text-yellow-300",
+                        )}
+                      >
+                        {audit.real_enhancement ? "Real" : "Marginal"}
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-3 gap-2 text-center text-muted-foreground">
+                      <Metric label="Sharpness" value={audit.sharpness_gain} />
+                      <Metric label="Detail" value={audit.detail_gain} />
+                      <Metric label="Denoise" value={audit.noise_reduction} />
+                    </div>
+                    <div className="mt-2 text-[11px] text-muted-foreground italic">{audit.verdict}</div>
                   </div>
+                )}
+
+                {error && (
+                  <div className="mt-4 rounded-md border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-200">{error}</div>
                 )}
               </div>
             </div>
@@ -580,19 +721,19 @@ function Index() {
         {/* Features */}
         <section id="features" className="mt-16 grid gap-5 md:grid-cols-3">
           <Feature
-            title="Lanczos Upscaling"
-            body="High-fidelity Lanczos resampling preserves edges and texture detail when scaling to 4K."
-            icon="⬆"
+            title="Real-ESRGAN GPU"
+            body="Real generative AI upscaling running on managed GPUs — true detail synthesis, not Lanczos stretching."
+            icon="⚡"
           />
           <Feature
-            title="Unsharp Mask"
-            body="A 5:5:1.0 unsharp pass restores micro-contrast lost during compression and re-sampling."
-            icon="✦"
+            title="AI Quality Auditor"
+            body="Gemini compares before/after frames and reports actual sharpness, detail and denoise gains. Catches fake upscalers."
+            icon="🛡"
           />
           <Feature
-            title="YouTube Ready"
-            body="yuv420p, faststart and CRF 23 ultrafast — uploads survive YouTube's re-encode with minimal loss."
-            icon="▶"
+            title="Anti-Piracy Filter"
+            body="Every upload is screened for streaming-service watermarks and theater-cam markers before any GPU work."
+            icon="©"
           />
         </section>
 
@@ -601,11 +742,11 @@ function Index() {
           <h2 className="font-display text-2xl md:text-3xl">How it works</h2>
           <div className="mt-6 grid gap-4 md:grid-cols-5">
             {[
-              ["Drop", "Pick a clip from your device. Nothing is uploaded."],
-              ["Analyze", "We inspect resolution, codec, and duration."],
-              ["Enhance", "Lanczos + unsharp + EQ filters chained in ffmpeg."],
-              ["Render", "libx264 ultrafast / CRF 23 / yuv420p."],
-              ["Download", "Compare before/after, then download the MP4."],
+              ["Drop", "Pick a clip up to 60MB."],
+              ["AI Scan", "Anti-piracy AI verifies content."],
+              ["Upload", "Sent securely to GPU server."],
+              ["Real-ESRGAN", "Generative 2-4× upscale on GPU."],
+              ["Audit", "AI verifies real enhancement, not fake."],
             ].map(([t, b], i) => (
               <div key={t} className="glass rounded-xl p-5">
                 <div className="mb-2 text-[11px] uppercase tracking-[0.25em] text-[#ff7aa3]">Step {i + 1}</div>
@@ -618,21 +759,50 @@ function Index() {
 
         {/* FAQ */}
         <section id="faq" className="mt-16 grid gap-4 md:grid-cols-2">
-          <Faq q="Is my video uploaded to a server?" a="No. The entire pipeline runs in your browser via ffmpeg.wasm. Your file never leaves the device." />
-          <Faq q="What's the maximum resolution?" a="Up to 10K (10240×5760). 4K is the recommended sweet spot. 8K/10K work on strong devices but use more memory and time." />
-          <Faq q="Why CRF 20 / superfast?" a="Superfast preset + CRF 20 with film tuning gives near-veryfast quality while staying inside the 10-minute browser budget." />
-          <Faq q="Best clip length?" a="Under 90 seconds gives the most consistent results at 4K+. Longer clips may exceed the 10-minute processing cap." />
+          <Faq
+            q="Is this real AI or just stretching pixels?"
+            a="Real Real-ESRGAN inference on managed GPUs. Our independent Gemini auditor compares before/after frames after every job and shows you the gain numbers — if it's fake, you'll see zeros."
+          />
+          <Faq
+            q="How fast is it?"
+            a="A 30-60 second clip typically finishes in 30-90 seconds depending on GPU queue. Way faster than browser-only ffmpeg."
+          />
+          <Faq
+            q="Is my video stored?"
+            a="No. Replicate auto-deletes outputs ~1 hour after creation. We don't store anything on our servers. See the Privacy page."
+          />
+          <Faq
+            q="What about copyrighted content?"
+            a="An AI screener checks the first frame for streaming-service watermarks and theater-cam patterns and blocks suspected piracy. See Terms & Copyright."
+          />
         </section>
 
-        <footer className="mt-16 flex flex-col items-center gap-2 text-xs text-muted-foreground">
-          <div>© {new Date().getFullYear()} NEONUPSCALE · Built with ffmpeg.wasm</div>
+        <footer className="mt-16 flex flex-col items-center gap-3 text-xs text-muted-foreground">
+          <div className="flex flex-wrap items-center justify-center gap-4">
+            <Link to="/privacy" className="hover:text-foreground">Privacy</Link>
+            <span className="opacity-30">·</span>
+            <Link to="/terms" className="hover:text-foreground">Terms</Link>
+            <span className="opacity-30">·</span>
+            <Link to="/copyright" className="hover:text-foreground">Copyright / DMCA</Link>
+          </div>
+          <div>© {new Date().getFullYear()} NEONUPSCALE · Real GPU AI Video Enhancer</div>
         </footer>
       </section>
     </div>
   );
 }
 
-function Toggle({ label, checked, onChange, disabled }: { label: string; checked: boolean; onChange: (v: boolean) => void; disabled?: boolean }) {
+function Toggle({
+  label,
+  checked,
+  onChange,
+  disabled,
+}: {
+  label: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  disabled?: boolean;
+}) {
   return (
     <label className={classNames("flex items-center justify-between gap-3 text-sm", disabled && "opacity-60")}>
       <span className="text-muted-foreground">{label}</span>
@@ -641,17 +811,29 @@ function Toggle({ label, checked, onChange, disabled }: { label: string; checked
         onClick={() => !disabled && onChange(!checked)}
         className={classNames(
           "relative h-6 w-11 rounded-full transition-colors",
-          checked ? "bg-[#ff0050]" : "bg-white/15"
+          checked ? "bg-[#ff0050]" : "bg-white/15",
         )}
         aria-pressed={checked}
         disabled={disabled}
       >
-        <span className={classNames(
-          "absolute top-0.5 h-5 w-5 rounded-full bg-white shadow transition-all",
-          checked ? "left-[22px]" : "left-0.5"
-        )} />
+        <span
+          className={classNames(
+            "absolute top-0.5 h-5 w-5 rounded-full bg-white shadow transition-all",
+            checked ? "left-[22px]" : "left-0.5",
+          )}
+        />
       </button>
     </label>
+  );
+}
+
+function Metric({ label, value }: { label: string; value: number }) {
+  const v = Math.max(0, Math.min(100, Math.round(value)));
+  return (
+    <div>
+      <div className="font-display text-lg text-foreground tabular-nums">{v}</div>
+      <div className="text-[10px] uppercase tracking-widest">{label}</div>
+    </div>
   );
 }
 
