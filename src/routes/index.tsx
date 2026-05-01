@@ -27,9 +27,11 @@ const RES_OPTIONS = [
   { id: "1080p", label: "1080p Full HD", w: 1920, h: 1080 },
   { id: "1440p", label: "1440p QHD", w: 2560, h: 1440 },
   { id: "2160p", label: "4K Ultra HD", w: 3840, h: 2160 },
+  { id: "4320p", label: "8K Ultra HD", w: 7680, h: 4320 },
+  { id: "10k", label: "10K Cinema", w: 10240, h: 5760 },
 ] as const;
 
-const MAX_PROCESS_MS = 5 * 60 * 1000;
+const MAX_PROCESS_MS = 10 * 60 * 1000;
 
 function classNames(...s: (string | false | null | undefined)[]) {
   return s.filter(Boolean).join(" ");
