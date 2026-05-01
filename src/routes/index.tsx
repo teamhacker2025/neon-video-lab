@@ -6,8 +6,8 @@ import { fetchFile, toBlobURL } from "@ffmpeg/util";
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
-      { title: "NEONUPSCALE — AI Video Enhancer up to 4K" },
-      { name: "description", content: "Free in-browser video enhancer. Upscale to 4K with Lanczos, sharpen, color-grade, and YouTube-optimize. 100% client-side via ffmpeg.wasm." },
+      { title: "NEONUPSCALE — AI Video Enhancer up to 10K" },
+      { name: "description", content: "Free in-browser AI video enhancer. Upscale to 4K, 8K, even 10K with denoise, Lanczos, sharpen, and color-grade. 100% client-side via ffmpeg.wasm." },
     ],
   }),
   component: Index,
