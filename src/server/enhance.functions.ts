@@ -167,9 +167,12 @@ export const startEnhance = createServerFn({ method: "POST" })
     const pred = await createPrediction({
       version: VIDEO_UPSCALE_MODEL_VERSION,
       input: {
-        image: data.videoDataUrl, // nightmareai/real-esrgan accepts video too via "image" field
+        // lucataco/real-esrgan-video field is `video_path`
+        video_path: data.videoDataUrl,
+        // Model accepts integer scale 2 or 4
         scale: data.scale,
-        face_enhance: data.faceEnhance,
+        // Built-in face restore model
+        model_name: data.faceEnhance ? "RealESRGAN_x4plus" : "realesr-animevideov3",
       },
     });
     return {

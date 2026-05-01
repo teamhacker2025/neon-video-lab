@@ -6,12 +6,10 @@
 const REPLICATE_API = "https://api.replicate.com/v1";
 
 // Public, well-known Replicate model versions (pinned).
-// Real-ESRGAN video upscaler (4x) — accepts input video, returns enhanced video URL.
+// lucataco/real-esrgan-video — accepts an MP4 video, returns enhanced MP4 URL.
+// https://replicate.com/lucataco/real-esrgan-video
 export const VIDEO_UPSCALE_MODEL_VERSION =
-  "f121d640bd286e1fdc67f9799164c1d5be36ff74576ee11c803ae5b665dd46aa"; // nightmareai/real-esrgan
-// RIFE frame interpolation — converts low-FPS video to smooth high-FPS.
-export const FPS_INTERPOLATE_MODEL_VERSION =
-  "1f3a4ce134b51f4eb6b8c7f3a8e4a7bf2e1cf83ed9c0e9f7c8d4e9b1a4f4c5d6"; // pollinations/rife placeholder
+  "3e56ce4b57863bd03048b42bc09bdd4db20d427cca5fde9d8ae4dc60e1bb4775";
 
 export type ReplicateStatus =
   | "starting"
