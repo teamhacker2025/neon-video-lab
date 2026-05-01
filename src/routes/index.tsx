@@ -619,9 +619,9 @@ function Index() {
         {/* FAQ */}
         <section id="faq" className="mt-16 grid gap-4 md:grid-cols-2">
           <Faq q="Is my video uploaded to a server?" a="No. The entire pipeline runs in your browser via ffmpeg.wasm. Your file never leaves the device." />
-          <Faq q="Why is 4K the maximum?" a="ffmpeg.wasm runs under a ~2GB WebAssembly memory cap. Higher resolutions like 8K or 16K aren't reliable client-side." />
-          <Faq q="Why CRF 23 and ultrafast?" a="ffmpeg.wasm has no hardware encoder. Ultrafast keeps you under the 5-minute processing budget while CRF 23 stays visually clean." />
-          <Faq q="Best clip length?" a="Under 60 seconds gives the most consistent results. Longer clips may exceed the 5-minute processing cap." />
+          <Faq q="What's the maximum resolution?" a="Up to 10K (10240×5760). 4K is the recommended sweet spot. 8K/10K work on strong devices but use more memory and time." />
+          <Faq q="Why CRF 20 / superfast?" a="Superfast preset + CRF 20 with film tuning gives near-veryfast quality while staying inside the 10-minute browser budget." />
+          <Faq q="Best clip length?" a="Under 90 seconds gives the most consistent results at 4K+. Longer clips may exceed the 10-minute processing cap." />
         </section>
 
         <footer className="mt-16 flex flex-col items-center gap-2 text-xs text-muted-foreground">
