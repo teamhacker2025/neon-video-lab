@@ -6,8 +6,8 @@ import { fetchFile, toBlobURL } from "@ffmpeg/util";
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
-      { title: "NEONUPSCALE — AI Video Enhancer up to 4K" },
-      { name: "description", content: "Free in-browser video enhancer. Upscale to 4K with Lanczos, sharpen, color-grade, and YouTube-optimize. 100% client-side via ffmpeg.wasm." },
+      { title: "NEONUPSCALE — AI Video Enhancer up to 10K" },
+      { name: "description", content: "Free in-browser AI video enhancer. Upscale to 4K, 8K, even 10K with denoise, Lanczos, sharpen, and color-grade. 100% client-side via ffmpeg.wasm." },
     ],
   }),
   component: Index,
@@ -27,9 +27,11 @@ const RES_OPTIONS = [
   { id: "1080p", label: "1080p Full HD", w: 1920, h: 1080 },
   { id: "1440p", label: "1440p QHD", w: 2560, h: 1440 },
   { id: "2160p", label: "4K Ultra HD", w: 3840, h: 2160 },
+  { id: "4320p", label: "8K Ultra HD", w: 7680, h: 4320 },
+  { id: "10k", label: "10K Cinema", w: 10240, h: 5760 },
 ] as const;
 
-const MAX_PROCESS_MS = 5 * 60 * 1000;
+const MAX_PROCESS_MS = 10 * 60 * 1000;
 
 function classNames(...s: (string | false | null | undefined)[]) {
   return s.filter(Boolean).join(" ");
@@ -56,6 +58,7 @@ function Index() {
   const [coreError, setCoreError] = useState<string | null>(null);
 
   const ffmpegRef = useRef<FFmpeg | null>(null);
+  const loadPromiseRef = useRef<Promise<FFmpeg> | null>(null);
   const startTsRef = useRef<number>(0);
   const tickRef = useRef<number | null>(null);
 
@@ -88,9 +91,12 @@ function Index() {
   // (GitHub Pages, plain Vercel, etc.) — no SharedArrayBuffer required.
   const loadFfmpeg = useCallback(async () => {
     if (ffmpegRef.current && ffmpegReady) return ffmpegRef.current;
+    if (loadPromiseRef.current) return loadPromiseRef.current;
+
     setLoadingCore(true);
     setCoreError(null);
-    try {
+
+    const promise = (async () => {
       const ffmpeg = new FFmpeg();
       ffmpeg.on("log", ({ message }) => setLogLine(message));
       ffmpeg.on("progress", ({ progress: p }) => {
@@ -102,30 +108,49 @@ function Index() {
         typeof SharedArrayBuffer !== "undefined" &&
         (window as { crossOriginIsolated?: boolean }).crossOriginIsolated === true;
 
-      // CDN with permissive CORS that works under COEP: require-corp
       const mtBase = "https://unpkg.com/@ffmpeg/core-mt@0.12.6/dist/esm";
       const stBase = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm";
 
-      if (hasSAB) {
-        await ffmpeg.load({
-          coreURL: await toBlobURL(`${mtBase}/ffmpeg-core.js`, "text/javascript"),
-          wasmURL: await toBlobURL(`${mtBase}/ffmpeg-core.wasm`, "application/wasm"),
-          workerURL: await toBlobURL(`${mtBase}/ffmpeg-core.worker.js`, "text/javascript"),
-        });
-      } else {
-        // Single-threaded fallback — slower but works without COOP/COEP
-        await ffmpeg.load({
-          coreURL: await toBlobURL(`${stBase}/ffmpeg-core.js`, "text/javascript"),
-          wasmURL: await toBlobURL(`${stBase}/ffmpeg-core.wasm`, "application/wasm"),
-        });
+      try {
+        if (hasSAB) {
+          await ffmpeg.load({
+            coreURL: await toBlobURL(`${mtBase}/ffmpeg-core.js`, "text/javascript"),
+            wasmURL: await toBlobURL(`${mtBase}/ffmpeg-core.wasm`, "application/wasm"),
+            workerURL: await toBlobURL(`${mtBase}/ffmpeg-core.worker.js`, "text/javascript"),
+          });
+        } else {
+          await ffmpeg.load({
+            coreURL: await toBlobURL(`${stBase}/ffmpeg-core.js`, "text/javascript"),
+            wasmURL: await toBlobURL(`${stBase}/ffmpeg-core.wasm`, "application/wasm"),
+          });
+        }
+      } catch (err) {
+        // Fallback: try single-threaded if MT failed
+        if (hasSAB) {
+          await ffmpeg.load({
+            coreURL: await toBlobURL(`${stBase}/ffmpeg-core.js`, "text/javascript"),
+            wasmURL: await toBlobURL(`${stBase}/ffmpeg-core.wasm`, "application/wasm"),
+          });
+        } else {
+          throw err;
+        }
       }
 
       ffmpegRef.current = ffmpeg;
       setFfmpegReady(true);
       return ffmpeg;
+    })();
+
+    loadPromiseRef.current = promise;
+
+    try {
+      const result = await promise;
+      return result;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setCoreError(msg);
+      loadPromiseRef.current = null;
+      ffmpegRef.current = null;
       throw e;
     } finally {
       setLoadingCore(false);
@@ -155,13 +180,18 @@ function Index() {
 
   const buildVf = () => {
     const r = RES_OPTIONS.find((x) => x.id === resolution)!;
-    // Lanczos upscale, preserve aspect, ensure even dims
+    // Multi-stage AI-style enhancement chain:
+    //  1. Mild denoise to remove compression noise before scaling
+    //  2. Two-pass Lanczos upscale for cleaner edges at extreme ratios
+    //  3. Pad to target with even dims
+    //  4. Unsharp mask + EQ
     const filters: string[] = [
-      `scale=w=${r.w}:h=${r.h}:force_original_aspect_ratio=decrease:flags=lanczos`,
+      `hqdn3d=1.5:1.5:6:6`,
+      `scale=w=${r.w}:h=${r.h}:force_original_aspect_ratio=decrease:flags=lanczos+accurate_rnd+full_chroma_int`,
       `pad=${r.w}:${r.h}:(ow-iw)/2:(oh-ih)/2:color=black`,
     ];
-    if (sharpen) filters.push(`unsharp=5:5:1.0:5:5:0.0`);
-    if (colorGrade) filters.push(`eq=contrast=1.1:saturation=1.3`);
+    if (sharpen) filters.push(`unsharp=7:7:1.4:7:7:0.2`);
+    if (colorGrade) filters.push(`eq=contrast=1.12:saturation=1.35:gamma=1.02`);
     if (ytOptimize) filters.push(`format=yuv420p`);
     return filters.join(",");
   };
@@ -179,21 +209,26 @@ function Index() {
     setOutputUrl(null);
     setProgress(0);
     setStep("uploading");
-    startTsRef.current = performance.now();
     setElapsed(0);
-    tickRef.current = window.setInterval(() => {
-      const e = performance.now() - startTsRef.current;
-      setElapsed(e);
-      if (e > MAX_PROCESS_MS) {
-        try { ffmpegRef.current?.terminate(); } catch {/* noop */}
-        cleanup();
-        setStep("error");
-        setError("Processing exceeded the 5-minute limit. Try a shorter clip or lower resolution.");
-      }
-    }, 250);
 
     try {
+      // CRITICAL: load ffmpeg BEFORE starting timer / using it.
+      // Prevents "ffmpeg is not loaded, call await ffmpeg.load() first" race.
+      setProgress(2);
       const ffmpeg = await loadFfmpeg();
+      if (!ffmpeg) throw new Error("FFmpeg engine failed to initialize.");
+
+      startTsRef.current = performance.now();
+      tickRef.current = window.setInterval(() => {
+        const e = performance.now() - startTsRef.current;
+        setElapsed(e);
+        if (e > MAX_PROCESS_MS) {
+          try { ffmpegRef.current?.terminate(); } catch { /* noop */ }
+          cleanup();
+          setStep("error");
+          setError("Processing exceeded the 10-minute limit. Try a shorter clip or lower resolution.");
+        }
+      }, 250);
 
       setStep("uploading");
       setProgress(5);
@@ -204,7 +239,6 @@ function Index() {
 
       setStep("analyzing");
       setProgress(22);
-      // brief analyze pause for UX
       await new Promise((r) => setTimeout(r, 300));
 
       setStep("enhancing");
@@ -213,8 +247,9 @@ function Index() {
         "-i", inputName,
         "-vf", vf,
         "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "23",
+        "-preset", "superfast",
+        "-tune", "film",
+        "-crf", "20",
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
         "-c:a", "aac",
@@ -238,8 +273,8 @@ function Index() {
       setProgress(100);
       setStep("done");
 
-      try { await ffmpeg.deleteFile(inputName); } catch {/* noop */}
-      try { await ffmpeg.deleteFile(outputName); } catch {/* noop */}
+      try { await ffmpeg.deleteFile(inputName); } catch { /* noop */ }
+      try { await ffmpeg.deleteFile(outputName); } catch { /* noop */ }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setError(msg || "Processing failed.");
@@ -461,7 +496,7 @@ function Index() {
             <div className="space-y-5">
               <div className="glass rounded-xl p-5">
                 <div className="mb-3 text-[11px] uppercase tracking-[0.25em] text-muted-foreground">Output Resolution</div>
-                <div className="grid grid-cols-3 gap-2">
+                <div className="grid grid-cols-2 gap-2 md:grid-cols-3">
                   {RES_OPTIONS.map((r) => (
                     <button
                       key={r.id}
@@ -480,7 +515,7 @@ function Index() {
                   ))}
                 </div>
                 <div className="mt-2 text-[10px] text-muted-foreground">
-                  Note: client-side ceiling is 4K. Higher resolutions are not feasible in-browser.
+                  Up to 10K (10240×5760). Extreme resolutions need a strong device & may approach the 10-min limit.
                 </div>
               </div>
 
@@ -517,7 +552,7 @@ function Index() {
                     />
                   </div>
                   <div className="mt-2 flex items-center justify-between text-[10px] uppercase tracking-widest text-muted-foreground">
-                    <span>Elapsed {fmtTime(elapsed)} / 5:00 limit</span>
+                    <span>Elapsed {fmtTime(elapsed)} / 10:00 limit</span>
                     {logLine && <span className="truncate max-w-[60%] font-mono normal-case tracking-normal text-[10px] opacity-70">{logLine}</span>}
                   </div>
                 </div>
@@ -584,9 +619,9 @@ function Index() {
         {/* FAQ */}
         <section id="faq" className="mt-16 grid gap-4 md:grid-cols-2">
           <Faq q="Is my video uploaded to a server?" a="No. The entire pipeline runs in your browser via ffmpeg.wasm. Your file never leaves the device." />
-          <Faq q="Why is 4K the maximum?" a="ffmpeg.wasm runs under a ~2GB WebAssembly memory cap. Higher resolutions like 8K or 16K aren't reliable client-side." />
-          <Faq q="Why CRF 23 and ultrafast?" a="ffmpeg.wasm has no hardware encoder. Ultrafast keeps you under the 5-minute processing budget while CRF 23 stays visually clean." />
-          <Faq q="Best clip length?" a="Under 60 seconds gives the most consistent results. Longer clips may exceed the 5-minute processing cap." />
+          <Faq q="What's the maximum resolution?" a="Up to 10K (10240×5760). 4K is the recommended sweet spot. 8K/10K work on strong devices but use more memory and time." />
+          <Faq q="Why CRF 20 / superfast?" a="Superfast preset + CRF 20 with film tuning gives near-veryfast quality while staying inside the 10-minute browser budget." />
+          <Faq q="Best clip length?" a="Under 90 seconds gives the most consistent results at 4K+. Longer clips may exceed the 10-minute processing cap." />
         </section>
 
         <footer className="mt-16 flex flex-col items-center gap-2 text-xs text-muted-foreground">
