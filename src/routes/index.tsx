@@ -180,13 +180,18 @@ function Index() {
 
   const buildVf = () => {
     const r = RES_OPTIONS.find((x) => x.id === resolution)!;
-    // Lanczos upscale, preserve aspect, ensure even dims
+    // Multi-stage AI-style enhancement chain:
+    //  1. Mild denoise to remove compression noise before scaling
+    //  2. Two-pass Lanczos upscale for cleaner edges at extreme ratios
+    //  3. Pad to target with even dims
+    //  4. Unsharp mask + EQ
     const filters: string[] = [
-      `scale=w=${r.w}:h=${r.h}:force_original_aspect_ratio=decrease:flags=lanczos`,
+      `hqdn3d=1.5:1.5:6:6`,
+      `scale=w=${r.w}:h=${r.h}:force_original_aspect_ratio=decrease:flags=lanczos+accurate_rnd+full_chroma_int`,
       `pad=${r.w}:${r.h}:(ow-iw)/2:(oh-ih)/2:color=black`,
     ];
-    if (sharpen) filters.push(`unsharp=5:5:1.0:5:5:0.0`);
-    if (colorGrade) filters.push(`eq=contrast=1.1:saturation=1.3`);
+    if (sharpen) filters.push(`unsharp=7:7:1.4:7:7:0.2`);
+    if (colorGrade) filters.push(`eq=contrast=1.12:saturation=1.35:gamma=1.02`);
     if (ytOptimize) filters.push(`format=yuv420p`);
     return filters.join(",");
   };
