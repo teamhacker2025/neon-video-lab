@@ -58,6 +58,7 @@ function Index() {
   const [coreError, setCoreError] = useState<string | null>(null);
 
   const ffmpegRef = useRef<FFmpeg | null>(null);
+  const loadPromiseRef = useRef<Promise<FFmpeg> | null>(null);
   const startTsRef = useRef<number>(0);
   const tickRef = useRef<number | null>(null);
 
