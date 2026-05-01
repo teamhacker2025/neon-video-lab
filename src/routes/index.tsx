@@ -82,7 +82,10 @@ function Index() {
     setIsolated(typeof window !== "undefined" && (window as { crossOriginIsolated?: boolean }).crossOriginIsolated === true);
   }, []);
 
-  // Load ffmpeg core lazily on first interaction
+  // Load ffmpeg core lazily on first interaction.
+  // Picks multi-threaded core-mt when crossOriginIsolated (SharedArrayBuffer available),
+  // otherwise falls back to single-threaded core so it works on ANY host
+  // (GitHub Pages, plain Vercel, etc.) — no SharedArrayBuffer required.
   const loadFfmpeg = useCallback(async () => {
     if (ffmpegRef.current && ffmpegReady) return ffmpegRef.current;
     setLoadingCore(true);
@@ -91,17 +94,32 @@ function Index() {
       const ffmpeg = new FFmpeg();
       ffmpeg.on("log", ({ message }) => setLogLine(message));
       ffmpeg.on("progress", ({ progress: p }) => {
-        // p is 0..1 for the encode phase
         const pct = Math.max(0, Math.min(1, p)) * 100;
-        // Map encode progress into 25%..95% band of overall
         setProgress(25 + pct * 0.7);
       });
-      const baseURL = "https://unpkg.com/@ffmpeg/core-mt@0.12.6/dist/esm";
-      await ffmpeg.load({
-        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
-        wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm"),
-        workerURL: await toBlobURL(`${baseURL}/ffmpeg-core.worker.js`, "text/javascript"),
-      });
+
+      const hasSAB =
+        typeof SharedArrayBuffer !== "undefined" &&
+        (window as { crossOriginIsolated?: boolean }).crossOriginIsolated === true;
+
+      // CDN with permissive CORS that works under COEP: require-corp
+      const mtBase = "https://unpkg.com/@ffmpeg/core-mt@0.12.6/dist/esm";
+      const stBase = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm";
+
+      if (hasSAB) {
+        await ffmpeg.load({
+          coreURL: await toBlobURL(`${mtBase}/ffmpeg-core.js`, "text/javascript"),
+          wasmURL: await toBlobURL(`${mtBase}/ffmpeg-core.wasm`, "application/wasm"),
+          workerURL: await toBlobURL(`${mtBase}/ffmpeg-core.worker.js`, "text/javascript"),
+        });
+      } else {
+        // Single-threaded fallback — slower but works without COOP/COEP
+        await ffmpeg.load({
+          coreURL: await toBlobURL(`${stBase}/ffmpeg-core.js`, "text/javascript"),
+          wasmURL: await toBlobURL(`${stBase}/ffmpeg-core.wasm`, "application/wasm"),
+        });
+      }
+
       ffmpegRef.current = ffmpeg;
       setFfmpegReady(true);
       return ffmpeg;
@@ -516,7 +534,7 @@ function Index() {
                 )}
                 {mounted && isolated === false && (
                   <div className="mt-4 rounded-md border border-yellow-500/30 bg-yellow-500/10 p-3 text-[11px] text-yellow-200">
-                    Cross-origin isolation is OFF. SharedArrayBuffer required by ffmpeg.wasm needs the COOP/COEP headers (already configured in <code>vercel.json</code> &amp; <code>public/_headers</code>). It will work on the deployed site.
+                    Single-threaded engine active (SharedArrayBuffer unavailable on this host). Processing still works — just a bit slower. For 2–4× faster encoding, deploy with COOP/COEP headers (Cloudflare Pages, Netlify, or Vercel via the included <code>vercel.json</code>).
                   </div>
                 )}
               </div>
