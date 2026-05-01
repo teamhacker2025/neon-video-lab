@@ -209,21 +209,26 @@ function Index() {
     setOutputUrl(null);
     setProgress(0);
     setStep("uploading");
-    startTsRef.current = performance.now();
     setElapsed(0);
-    tickRef.current = window.setInterval(() => {
-      const e = performance.now() - startTsRef.current;
-      setElapsed(e);
-      if (e > MAX_PROCESS_MS) {
-        try { ffmpegRef.current?.terminate(); } catch {/* noop */}
-        cleanup();
-        setStep("error");
-        setError("Processing exceeded the 5-minute limit. Try a shorter clip or lower resolution.");
-      }
-    }, 250);
 
     try {
+      // CRITICAL: load ffmpeg BEFORE starting timer / using it.
+      // Prevents "ffmpeg is not loaded, call await ffmpeg.load() first" race.
+      setProgress(2);
       const ffmpeg = await loadFfmpeg();
+      if (!ffmpeg) throw new Error("FFmpeg engine failed to initialize.");
+
+      startTsRef.current = performance.now();
+      tickRef.current = window.setInterval(() => {
+        const e = performance.now() - startTsRef.current;
+        setElapsed(e);
+        if (e > MAX_PROCESS_MS) {
+          try { ffmpegRef.current?.terminate(); } catch { /* noop */ }
+          cleanup();
+          setStep("error");
+          setError("Processing exceeded the 10-minute limit. Try a shorter clip or lower resolution.");
+        }
+      }, 250);
 
       setStep("uploading");
       setProgress(5);
@@ -234,7 +239,6 @@ function Index() {
 
       setStep("analyzing");
       setProgress(22);
-      // brief analyze pause for UX
       await new Promise((r) => setTimeout(r, 300));
 
       setStep("enhancing");
@@ -243,8 +247,9 @@ function Index() {
         "-i", inputName,
         "-vf", vf,
         "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "23",
+        "-preset", "superfast",
+        "-tune", "film",
+        "-crf", "20",
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
         "-c:a", "aac",
@@ -268,8 +273,8 @@ function Index() {
       setProgress(100);
       setStep("done");
 
-      try { await ffmpeg.deleteFile(inputName); } catch {/* noop */}
-      try { await ffmpeg.deleteFile(outputName); } catch {/* noop */}
+      try { await ffmpeg.deleteFile(inputName); } catch { /* noop */ }
+      try { await ffmpeg.deleteFile(outputName); } catch { /* noop */ }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setError(msg || "Processing failed.");
