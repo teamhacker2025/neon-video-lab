@@ -515,7 +515,7 @@ function Index() {
                   ))}
                 </div>
                 <div className="mt-2 text-[10px] text-muted-foreground">
-                  Note: client-side ceiling is 4K. Higher resolutions are not feasible in-browser.
+                  Up to 10K (10240×5760). Extreme resolutions need a strong device & may approach the 10-min limit.
                 </div>
               </div>
 
