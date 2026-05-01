@@ -91,9 +91,12 @@ function Index() {
   // (GitHub Pages, plain Vercel, etc.) — no SharedArrayBuffer required.
   const loadFfmpeg = useCallback(async () => {
     if (ffmpegRef.current && ffmpegReady) return ffmpegRef.current;
+    if (loadPromiseRef.current) return loadPromiseRef.current;
+
     setLoadingCore(true);
     setCoreError(null);
-    try {
+
+    const promise = (async () => {
       const ffmpeg = new FFmpeg();
       ffmpeg.on("log", ({ message }) => setLogLine(message));
       ffmpeg.on("progress", ({ progress: p }) => {
@@ -105,30 +108,49 @@ function Index() {
         typeof SharedArrayBuffer !== "undefined" &&
         (window as { crossOriginIsolated?: boolean }).crossOriginIsolated === true;
 
-      // CDN with permissive CORS that works under COEP: require-corp
       const mtBase = "https://unpkg.com/@ffmpeg/core-mt@0.12.6/dist/esm";
       const stBase = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm";
 
-      if (hasSAB) {
-        await ffmpeg.load({
-          coreURL: await toBlobURL(`${mtBase}/ffmpeg-core.js`, "text/javascript"),
-          wasmURL: await toBlobURL(`${mtBase}/ffmpeg-core.wasm`, "application/wasm"),
-          workerURL: await toBlobURL(`${mtBase}/ffmpeg-core.worker.js`, "text/javascript"),
-        });
-      } else {
-        // Single-threaded fallback — slower but works without COOP/COEP
-        await ffmpeg.load({
-          coreURL: await toBlobURL(`${stBase}/ffmpeg-core.js`, "text/javascript"),
-          wasmURL: await toBlobURL(`${stBase}/ffmpeg-core.wasm`, "application/wasm"),
-        });
+      try {
+        if (hasSAB) {
+          await ffmpeg.load({
+            coreURL: await toBlobURL(`${mtBase}/ffmpeg-core.js`, "text/javascript"),
+            wasmURL: await toBlobURL(`${mtBase}/ffmpeg-core.wasm`, "application/wasm"),
+            workerURL: await toBlobURL(`${mtBase}/ffmpeg-core.worker.js`, "text/javascript"),
+          });
+        } else {
+          await ffmpeg.load({
+            coreURL: await toBlobURL(`${stBase}/ffmpeg-core.js`, "text/javascript"),
+            wasmURL: await toBlobURL(`${stBase}/ffmpeg-core.wasm`, "application/wasm"),
+          });
+        }
+      } catch (err) {
+        // Fallback: try single-threaded if MT failed
+        if (hasSAB) {
+          await ffmpeg.load({
+            coreURL: await toBlobURL(`${stBase}/ffmpeg-core.js`, "text/javascript"),
+            wasmURL: await toBlobURL(`${stBase}/ffmpeg-core.wasm`, "application/wasm"),
+          });
+        } else {
+          throw err;
+        }
       }
 
       ffmpegRef.current = ffmpeg;
       setFfmpegReady(true);
       return ffmpeg;
+    })();
+
+    loadPromiseRef.current = promise;
+
+    try {
+      const result = await promise;
+      return result;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setCoreError(msg);
+      loadPromiseRef.current = null;
+      ffmpegRef.current = null;
       throw e;
     } finally {
       setLoadingCore(false);
