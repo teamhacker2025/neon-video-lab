@@ -496,7 +496,7 @@ function Index() {
             <div className="space-y-5">
               <div className="glass rounded-xl p-5">
                 <div className="mb-3 text-[11px] uppercase tracking-[0.25em] text-muted-foreground">Output Resolution</div>
-                <div className="grid grid-cols-3 gap-2">
+                <div className="grid grid-cols-2 gap-2 md:grid-cols-3">
                   {RES_OPTIONS.map((r) => (
                     <button
                       key={r.id}
