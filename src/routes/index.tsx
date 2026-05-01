@@ -552,7 +552,7 @@ function Index() {
                     />
                   </div>
                   <div className="mt-2 flex items-center justify-between text-[10px] uppercase tracking-widest text-muted-foreground">
-                    <span>Elapsed {fmtTime(elapsed)} / 5:00 limit</span>
+                    <span>Elapsed {fmtTime(elapsed)} / 10:00 limit</span>
                     {logLine && <span className="truncate max-w-[60%] font-mono normal-case tracking-normal text-[10px] opacity-70">{logLine}</span>}
                   </div>
                 </div>
