@@ -4,8 +4,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   abortEnhance,
   checkCopyright,
+  cleanupFile,
+  finalizeUpload,
+  initUpload,
   pollEnhance,
   startEnhance,
+  startInterpolate,
+  uploadChunk,
   verifyEnhancement,
 } from "@/server/enhance.functions";
 
@@ -30,19 +35,21 @@ export const Route = createFileRoute("/")({
 
 type Step =
   | "idle"
-  | "scanning" // anti-piracy AI scan
-  | "uploading" // sending to server
-  | "queued" // Replicate queued
-  | "enhancing" // GPU running
-  | "auditing" // verify watchdog
+  | "scanning"
+  | "uploading"
+  | "queued"
+  | "enhancing"
+  | "interpolating"
+  | "auditing"
   | "done"
   | "error";
 
 const STEPS: { id: Exclude<Step, "idle" | "done" | "error">; label: string }[] = [
-  { id: "scanning", label: "AI Safety Scan" },
-  { id: "uploading", label: "Uploading" },
+  { id: "scanning", label: "AI Scan" },
+  { id: "uploading", label: "Upload" },
   { id: "queued", label: "Queued" },
-  { id: "enhancing", label: "GPU Enhancing" },
+  { id: "enhancing", label: "GPU Upscale" },
+  { id: "interpolating", label: "FPS Boost" },
   { id: "auditing", label: "AI Audit" },
 ];
 
@@ -51,9 +58,16 @@ const SCALE_OPTIONS = [
   { id: 4, label: "4× Ultra", subtitle: "Best quality (~30-60s)" },
 ] as const;
 
-const MAX_FILE_MB = 60; // safe inline upload size for Replicate data URI
-const MAX_PROCESS_MS = 8 * 60 * 1000; // 8-min server-side cap
+const FPS_OPTIONS = [
+  { id: 0, label: "Original FPS", subtitle: "Skip interpolation" },
+  { id: 60, label: "60 FPS", subtitle: "Smooth (~+30s)" },
+  { id: 100, label: "100 FPS", subtitle: "Ultra-smooth (~+60s)" },
+] as const;
+
+const MAX_FILE_MB = 500; // resumable upload cap
+const MAX_PROCESS_MS = 10 * 60 * 1000; // 10-min cap
 const POLL_MS = 1500;
+const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB per chunk
 
 function classNames(...s: (string | false | null | undefined)[]) {
   return s.filter(Boolean).join(" ");
@@ -70,16 +84,6 @@ function fmtTime(ms: number) {
   const s = Math.max(0, Math.floor(ms / 1000));
   const m = Math.floor(s / 60);
   return `${m}:${String(s % 60).padStart(2, "0")}`;
-}
-
-// Read a File and return a "data:video/...;base64,..." URL via FileReader (no full base64 in JS land).
-function fileToDataURL(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(reader.error ?? new Error("File read failed"));
-    reader.onload = () => resolve(reader.result as string);
-    reader.readAsDataURL(file);
-  });
 }
 
 // Sample one frame from a video file at a given time and return a JPEG data URL.
@@ -153,12 +157,27 @@ async function sampleFrameFromUrl(url: string, atSec: number, maxW = 640): Promi
   });
 }
 
+// Convert a Uint8Array chunk to base64 (browser-safe, no large string spreads).
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    bin += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunkSize)) as number[]);
+  }
+  return btoa(bin);
+}
+
 function Index() {
   const startEnhanceFn = useServerFn(startEnhance);
+  const startInterpolateFn = useServerFn(startInterpolate);
   const pollEnhanceFn = useServerFn(pollEnhance);
   const abortEnhanceFn = useServerFn(abortEnhance);
   const checkCopyrightFn = useServerFn(checkCopyright);
   const verifyEnhancementFn = useServerFn(verifyEnhancement);
+  const initUploadFn = useServerFn(initUpload);
+  const uploadChunkFn = useServerFn(uploadChunk);
+  const finalizeUploadFn = useServerFn(finalizeUpload);
+  const cleanupFileFn = useServerFn(cleanupFile);
 
   const [file, setFile] = useState<File | null>(null);
   const [inputUrl, setInputUrl] = useState<string | null>(null);
@@ -168,9 +187,11 @@ function Index() {
   const [error, setError] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [statusLine, setStatusLine] = useState("");
+  const [logTail, setLogTail] = useState<string>("");
 
   const [scale, setScale] = useState<2 | 4>(4);
   const [faceEnhance, setFaceEnhance] = useState(true);
+  const [targetFps, setTargetFps] = useState<0 | 60 | 100>(0);
   const [acceptedTerms, setAcceptedTerms] = useState(false);
 
   const [audit, setAudit] = useState<null | {
@@ -189,6 +210,7 @@ function Index() {
   const startTsRef = useRef<number>(0);
   const tickRef = useRef<number | null>(null);
   const predIdRef = useRef<string | null>(null);
+  const uploadedFileIdRef = useRef<string | null>(null);
   const cancelledRef = useRef(false);
 
   const onPickFile = (f: File | null) => {
@@ -240,6 +262,43 @@ function Index() {
     setStatusLine("Cancelled");
   }, [abortEnhanceFn]);
 
+  // Poll a prediction until terminal, streaming logs + parsed progress.
+  const pollUntilDone = async (
+    id: string,
+    phase: "enhancing" | "interpolating",
+    progressFloor: number,
+    progressCeil: number,
+  ): Promise<string> => {
+    let smoothPct = progressFloor;
+    while (true) {
+      if (cancelledRef.current) throw new Error("cancelled");
+      const p = await pollEnhanceFn({ data: { id } });
+      if (p.logs) setLogTail(p.logs);
+      setStatusLine(`GPU ${p.status}…`);
+      if (p.status === "processing") setStep(phase);
+
+      // Real progress from logs if available, else smooth fake progress
+      if (typeof p.progress === "number") {
+        const mapped = progressFloor + ((progressCeil - progressFloor) * p.progress) / 100;
+        smoothPct = Math.max(smoothPct, mapped);
+      } else {
+        smoothPct = Math.min(progressCeil - 2, smoothPct + 0.8);
+      }
+      setProgress(smoothPct);
+
+      if (p.status === "succeeded") {
+        const out = Array.isArray(p.output) ? p.output[0] : p.output;
+        if (!out || typeof out !== "string") throw new Error("Replicate returned no output URL.");
+        setProgress(progressCeil);
+        return out;
+      }
+      if (p.status === "failed" || p.status === "canceled") {
+        throw new Error(p.error || `Replicate ${p.status}`);
+      }
+      await new Promise((r) => setTimeout(r, POLL_MS));
+    }
+  };
+
   const enhance = async () => {
     if (!file) return;
     if (!acceptedTerms) {
@@ -250,10 +309,12 @@ function Index() {
     setOutputUrl(null);
     setAudit(null);
     setPiracyWarn(null);
+    setLogTail("");
     setProgress(0);
     setElapsed(0);
     cancelledRef.current = false;
     predIdRef.current = null;
+    uploadedFileIdRef.current = null;
 
     startTsRef.current = performance.now();
     tickRef.current = window.setInterval(() => {
@@ -262,17 +323,17 @@ function Index() {
       if (e > MAX_PROCESS_MS) {
         cancel();
         setStep("error");
-        setError("Processing exceeded the 8-minute limit. Try a shorter clip or 2× scale.");
+        setError("Processing exceeded the 10-minute limit. Try a shorter clip or 2× scale.");
       }
     }, 250);
 
     try {
-      // 1) Anti-piracy AI scan on first usable frame
+      // 1) Anti-piracy AI scan
       setStep("scanning");
       setStatusLine("Sampling frame for safety check…");
-      setProgress(4);
+      setProgress(3);
       const beforeFrame = await sampleFrameAt(file, 1.0).catch(() => sampleFrameAt(file, 0.2));
-      setProgress(8);
+      setProgress(6);
       const verdict = await checkCopyrightFn({ data: { imageDataUrl: beforeFrame } });
       if (cancelledRef.current) return;
       if (verdict.verdict === "block") {
@@ -286,67 +347,84 @@ function Index() {
       if (verdict.verdict === "warn") {
         setPiracyWarn(verdict.reason || "AI flagged this as possibly copyrighted — proceeding under your declared ownership.");
       }
-      setProgress(14);
+      setProgress(10);
 
-      // 2) Encode to data URL & send to server
+      // 2) Resumable chunked upload to Replicate Files (auto-TTL ~24h)
       setStep("uploading");
-      setStatusLine("Encoding & uploading to GPU…");
-      const dataUrl = await fileToDataURL(file);
-      if (cancelledRef.current) return;
-      setProgress(22);
+      setStatusLine(`Uploading ${fmtBytes(file.size)} in chunks…`);
+      const { sessionId } = await initUploadFn({
+        data: {
+          filename: file.name,
+          contentType: file.type || "video/mp4",
+          totalBytes: file.size,
+        },
+      });
+      const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+      for (let i = 0; i < totalChunks; i++) {
+        if (cancelledRef.current) return;
+        const start = i * CHUNK_SIZE;
+        const end = Math.min(file.size, start + CHUNK_SIZE);
+        const buf = new Uint8Array(await file.slice(start, end).arrayBuffer());
+        const b64 = bytesToBase64(buf);
+        await uploadChunkFn({ data: { sessionId, index: i, chunkBase64: b64 } });
+        const pct = 10 + ((i + 1) / totalChunks) * 15; // 10 → 25
+        setProgress(pct);
+        setStatusLine(`Uploading ${i + 1}/${totalChunks} chunks…`);
+      }
+      const { fileId, url: videoUrl } = await finalizeUploadFn({ data: { sessionId } });
+      uploadedFileIdRef.current = fileId;
+      setProgress(26);
 
+      // 3) Start Real-ESRGAN
+      setStep("queued");
+      setStatusLine("Queueing GPU job…");
       const created = await startEnhanceFn({
-        data: { videoDataUrl: dataUrl, scale, faceEnhance },
+        data: { videoUrl, scale, faceEnhance },
       });
       if (cancelledRef.current) return;
       predIdRef.current = created.id;
       setStatusLine(`Prediction ${created.id.slice(0, 8)} queued`);
-      setProgress(28);
 
-      // 3) Poll
-      setStep("queued");
-      let lastStatus = created.status;
-      let pollProgress = 30;
-      while (true) {
-        if (cancelledRef.current) return;
-        const p = await pollEnhanceFn({ data: { id: created.id } });
-        lastStatus = p.status;
-        setStatusLine(`GPU ${p.status}…`);
+      // Decide phase budgets
+      const willInterpolate = targetFps > 0;
+      const upscaleCeil = willInterpolate ? 70 : 88;
+      const upscaledUrl = await pollUntilDone(created.id, "enhancing", 28, upscaleCeil);
 
-        if (p.status === "processing") setStep("enhancing");
+      // 4) Optional RIFE FPS interpolation
+      let finalUrl = upscaledUrl;
+      if (willInterpolate) {
+        setStep("interpolating");
+        setStatusLine(`Interpolating to ${targetFps} FPS…`);
+        const rife = await startInterpolateFn({
+          data: { videoUrl: upscaledUrl, targetFps },
+        });
+        predIdRef.current = rife.id;
+        finalUrl = await pollUntilDone(rife.id, "interpolating", upscaleCeil, 88);
+      }
 
-        // Smooth fake-progress bar (real % isn't reported by Replicate for video)
-        pollProgress = Math.min(85, pollProgress + 1.2);
-        setProgress(pollProgress);
+      // 5) AI quality audit
+      setStep("auditing");
+      setStatusLine("AI auditing real enhancement…");
+      try {
+        const afterFrame = await sampleFrameFromUrl(finalUrl, 1.0);
+        const a = await verifyEnhancementFn({
+          data: { beforeDataUrl: beforeFrame, afterDataUrl: afterFrame },
+        });
+        setAudit(a);
+      } catch {
+        /* non-fatal */
+      }
 
-        if (p.status === "succeeded") {
-          const out = Array.isArray(p.output) ? p.output[0] : p.output;
-          if (!out || typeof out !== "string") throw new Error("Replicate returned no output URL.");
-          setProgress(88);
+      setOutputUrl(finalUrl);
+      setProgress(100);
+      setStep("done");
+      cleanup();
 
-          // 4) AI quality audit — sample frame from output and compare
-          setStep("auditing");
-          setStatusLine("AI auditing real enhancement…");
-          try {
-            const afterFrame = await sampleFrameFromUrl(out, 1.0);
-            const a = await verifyEnhancementFn({
-              data: { beforeDataUrl: beforeFrame, afterDataUrl: afterFrame },
-            });
-            setAudit(a);
-          } catch {
-            // non-fatal
-          }
-
-          setOutputUrl(out);
-          setProgress(100);
-          setStep("done");
-          cleanup();
-          return;
-        }
-        if (p.status === "failed" || p.status === "canceled") {
-          throw new Error(p.error || `Replicate ${p.status}`);
-        }
-        await new Promise((r) => setTimeout(r, POLL_MS));
+      // 6) Server-side cleanup of uploaded source (TTL belt-and-braces).
+      // Output URL also auto-expires (~1h Replicate-managed).
+      if (uploadedFileIdRef.current) {
+        cleanupFileFn({ data: { fileId: uploadedFileIdRef.current } }).catch(() => {});
+        uploadedFileIdRef.current = null;
       }
     } catch (e) {
       if (cancelledRef.current) return;
@@ -354,6 +432,11 @@ function Index() {
       setError(msg || "Processing failed.");
       setStep("error");
       cleanup();
+      // best-effort cleanup on failure too
+      if (uploadedFileIdRef.current) {
+        cleanupFileFn({ data: { fileId: uploadedFileIdRef.current } }).catch(() => {});
+        uploadedFileIdRef.current = null;
+      }
     }
   };
 
@@ -370,6 +453,7 @@ function Index() {
     setStatusLine("");
     setAudit(null);
     setPiracyWarn(null);
+    setLogTail("");
   };
 
   // Sync before/after playback for slider compare
@@ -454,7 +538,7 @@ function Index() {
       <section className="relative z-10 mx-auto max-w-7xl px-6 pb-20">
         <div className="glass-strong relative overflow-hidden rounded-2xl p-6 md:p-8 scanline">
           {/* Step tracker */}
-          <ol className="relative mb-8 grid grid-cols-5 gap-2 md:gap-4">
+          <ol className="relative mb-8 grid grid-cols-6 gap-2 md:gap-4">
             {STEPS.map((s, i) => {
               const active = i === stepIndex;
               const done = i < stepIndex || step === "done";
@@ -616,6 +700,31 @@ function Index() {
                 </div>
               </div>
 
+              <div className="glass rounded-xl p-5">
+                <div className="mb-3 text-[11px] uppercase tracking-[0.25em] text-muted-foreground">FPS Boost (RIFE AI)</div>
+                <div className="grid grid-cols-3 gap-2">
+                  {FPS_OPTIONS.map((r) => (
+                    <button
+                      key={r.id}
+                      disabled={isProcessing}
+                      onClick={() => setTargetFps(r.id as 0 | 60 | 100)}
+                      className={classNames(
+                        "rounded-md border px-2 py-3 text-xs font-medium transition",
+                        targetFps === r.id
+                          ? "border-[#ff0050] bg-[#ff0050]/15 text-foreground neon-border"
+                          : "border-white/10 text-muted-foreground hover:text-foreground hover:border-white/25",
+                      )}
+                    >
+                      <div className="font-display text-sm">{r.label}</div>
+                      <div className="mt-0.5 text-[10px] tracking-wider">{r.subtitle}</div>
+                    </button>
+                  ))}
+                </div>
+                <div className="mt-2 text-[10px] text-muted-foreground">
+                  RIFE generates intermediate frames on GPU for ultra-smooth playback. Adds a second GPU pass.
+                </div>
+              </div>
+
               <div className="glass rounded-xl p-5 space-y-3">
                 <div className="text-[11px] uppercase tracking-[0.25em] text-muted-foreground">Advanced</div>
                 <Toggle label="Face restoration (GFPGAN)" checked={faceEnhance} onChange={setFaceEnhance} disabled={isProcessing} />
@@ -675,12 +784,24 @@ function Index() {
                     />
                   </div>
                   <div className="mt-2 flex items-center justify-between text-[10px] uppercase tracking-widest text-muted-foreground">
-                    <span>Elapsed {fmtTime(elapsed)} / 8:00 limit</span>
+                    <span>Elapsed {fmtTime(elapsed)} / 10:00 limit</span>
                     {statusLine && (
                       <span className="truncate max-w-[60%] font-mono normal-case tracking-normal text-[10px] opacity-70">{statusLine}</span>
                     )}
                   </div>
                 </div>
+
+                {logTail && isProcessing && (
+                  <div className="mt-3 rounded-md border border-white/10 bg-black/40 p-2">
+                    <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-widest text-muted-foreground">
+                      <span>Live GPU Logs</span>
+                      <span className="h-1.5 w-1.5 rounded-full bg-[#ff0050] pulse-neon" />
+                    </div>
+                    <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-all font-mono text-[10px] leading-tight text-emerald-300/80">
+{logTail.split("\n").slice(-8).join("\n")}
+                    </pre>
+                  </div>
+                )}
 
                 {piracyWarn && (
                   <div className="mt-4 rounded-md border border-yellow-500/30 bg-yellow-500/10 p-3 text-xs text-yellow-200">
@@ -742,7 +863,7 @@ function Index() {
           <h2 className="font-display text-2xl md:text-3xl">How it works</h2>
           <div className="mt-6 grid gap-4 md:grid-cols-5">
             {[
-              ["Drop", "Pick a clip up to 60MB."],
+              ["Drop", "Pick a clip up to 500MB (resumable upload)."],
               ["AI Scan", "Anti-piracy AI verifies content."],
               ["Upload", "Sent securely to GPU server."],
               ["Real-ESRGAN", "Generative 2-4× upscale on GPU."],
