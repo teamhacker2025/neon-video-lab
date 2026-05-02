@@ -463,6 +463,7 @@ function Index() {
     setStatusLine("");
     setAudit(null);
     setPiracyWarn(null);
+    setLogTail("");
   };
 
   // Sync before/after playback for slider compare
