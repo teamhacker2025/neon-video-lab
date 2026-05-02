@@ -710,6 +710,31 @@ function Index() {
                 </div>
               </div>
 
+              <div className="glass rounded-xl p-5">
+                <div className="mb-3 text-[11px] uppercase tracking-[0.25em] text-muted-foreground">FPS Boost (RIFE AI)</div>
+                <div className="grid grid-cols-3 gap-2">
+                  {FPS_OPTIONS.map((r) => (
+                    <button
+                      key={r.id}
+                      disabled={isProcessing}
+                      onClick={() => setTargetFps(r.id as 0 | 60 | 100)}
+                      className={classNames(
+                        "rounded-md border px-2 py-3 text-xs font-medium transition",
+                        targetFps === r.id
+                          ? "border-[#ff0050] bg-[#ff0050]/15 text-foreground neon-border"
+                          : "border-white/10 text-muted-foreground hover:text-foreground hover:border-white/25",
+                      )}
+                    >
+                      <div className="font-display text-sm">{r.label}</div>
+                      <div className="mt-0.5 text-[10px] tracking-wider">{r.subtitle}</div>
+                    </button>
+                  ))}
+                </div>
+                <div className="mt-2 text-[10px] text-muted-foreground">
+                  RIFE generates intermediate frames on GPU for ultra-smooth playback. Adds a second GPU pass.
+                </div>
+              </div>
+
               <div className="glass rounded-xl p-5 space-y-3">
                 <div className="text-[11px] uppercase tracking-[0.25em] text-muted-foreground">Advanced</div>
                 <Toggle label="Face restoration (GFPGAN)" checked={faceEnhance} onChange={setFaceEnhance} disabled={isProcessing} />
