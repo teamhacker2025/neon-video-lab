@@ -548,7 +548,7 @@ function Index() {
       <section className="relative z-10 mx-auto max-w-7xl px-6 pb-20">
         <div className="glass-strong relative overflow-hidden rounded-2xl p-6 md:p-8 scanline">
           {/* Step tracker */}
-          <ol className="relative mb-8 grid grid-cols-5 gap-2 md:gap-4">
+          <ol className="relative mb-8 grid grid-cols-6 gap-2 md:gap-4">
             {STEPS.map((s, i) => {
               const active = i === stepIndex;
               const done = i < stepIndex || step === "done";
