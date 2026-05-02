@@ -86,16 +86,6 @@ function fmtTime(ms: number) {
   return `${m}:${String(s % 60).padStart(2, "0")}`;
 }
 
-// Read a File and return a "data:video/...;base64,..." URL via FileReader (no full base64 in JS land).
-function fileToDataURL(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(reader.error ?? new Error("File read failed"));
-    reader.onload = () => resolve(reader.result as string);
-    reader.readAsDataURL(file);
-  });
-}
-
 // Sample one frame from a video file at a given time and return a JPEG data URL.
 async function sampleFrameAt(file: File, atSec: number, maxW = 640): Promise<string> {
   return new Promise((resolve, reject) => {
