@@ -167,12 +167,27 @@ async function sampleFrameFromUrl(url: string, atSec: number, maxW = 640): Promi
   });
 }
 
+// Convert a Uint8Array chunk to base64 (browser-safe, no large string spreads).
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    bin += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunkSize)) as number[]);
+  }
+  return btoa(bin);
+}
+
 function Index() {
   const startEnhanceFn = useServerFn(startEnhance);
+  const startInterpolateFn = useServerFn(startInterpolate);
   const pollEnhanceFn = useServerFn(pollEnhance);
   const abortEnhanceFn = useServerFn(abortEnhance);
   const checkCopyrightFn = useServerFn(checkCopyright);
   const verifyEnhancementFn = useServerFn(verifyEnhancement);
+  const initUploadFn = useServerFn(initUpload);
+  const uploadChunkFn = useServerFn(uploadChunk);
+  const finalizeUploadFn = useServerFn(finalizeUpload);
+  const cleanupFileFn = useServerFn(cleanupFile);
 
   const [file, setFile] = useState<File | null>(null);
   const [inputUrl, setInputUrl] = useState<string | null>(null);
@@ -182,9 +197,11 @@ function Index() {
   const [error, setError] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [statusLine, setStatusLine] = useState("");
+  const [logTail, setLogTail] = useState<string>("");
 
   const [scale, setScale] = useState<2 | 4>(4);
   const [faceEnhance, setFaceEnhance] = useState(true);
+  const [targetFps, setTargetFps] = useState<0 | 60 | 100>(0);
   const [acceptedTerms, setAcceptedTerms] = useState(false);
 
   const [audit, setAudit] = useState<null | {
@@ -203,6 +220,7 @@ function Index() {
   const startTsRef = useRef<number>(0);
   const tickRef = useRef<number | null>(null);
   const predIdRef = useRef<string | null>(null);
+  const uploadedFileIdRef = useRef<string | null>(null);
   const cancelledRef = useRef(false);
 
   const onPickFile = (f: File | null) => {
