@@ -272,6 +272,43 @@ function Index() {
     setStatusLine("Cancelled");
   }, [abortEnhanceFn]);
 
+  // Poll a prediction until terminal, streaming logs + parsed progress.
+  const pollUntilDone = async (
+    id: string,
+    phase: "enhancing" | "interpolating",
+    progressFloor: number,
+    progressCeil: number,
+  ): Promise<string> => {
+    let smoothPct = progressFloor;
+    while (true) {
+      if (cancelledRef.current) throw new Error("cancelled");
+      const p = await pollEnhanceFn({ data: { id } });
+      if (p.logs) setLogTail(p.logs);
+      setStatusLine(`GPU ${p.status}…`);
+      if (p.status === "processing") setStep(phase);
+
+      // Real progress from logs if available, else smooth fake progress
+      if (typeof p.progress === "number") {
+        const mapped = progressFloor + ((progressCeil - progressFloor) * p.progress) / 100;
+        smoothPct = Math.max(smoothPct, mapped);
+      } else {
+        smoothPct = Math.min(progressCeil - 2, smoothPct + 0.8);
+      }
+      setProgress(smoothPct);
+
+      if (p.status === "succeeded") {
+        const out = Array.isArray(p.output) ? p.output[0] : p.output;
+        if (!out || typeof out !== "string") throw new Error("Replicate returned no output URL.");
+        setProgress(progressCeil);
+        return out;
+      }
+      if (p.status === "failed" || p.status === "canceled") {
+        throw new Error(p.error || `Replicate ${p.status}`);
+      }
+      await new Promise((r) => setTimeout(r, POLL_MS));
+    }
+  };
+
   const enhance = async () => {
     if (!file) return;
     if (!acceptedTerms) {
@@ -282,10 +319,12 @@ function Index() {
     setOutputUrl(null);
     setAudit(null);
     setPiracyWarn(null);
+    setLogTail("");
     setProgress(0);
     setElapsed(0);
     cancelledRef.current = false;
     predIdRef.current = null;
+    uploadedFileIdRef.current = null;
 
     startTsRef.current = performance.now();
     tickRef.current = window.setInterval(() => {
@@ -294,17 +333,17 @@ function Index() {
       if (e > MAX_PROCESS_MS) {
         cancel();
         setStep("error");
-        setError("Processing exceeded the 8-minute limit. Try a shorter clip or 2× scale.");
+        setError("Processing exceeded the 10-minute limit. Try a shorter clip or 2× scale.");
       }
     }, 250);
 
     try {
-      // 1) Anti-piracy AI scan on first usable frame
+      // 1) Anti-piracy AI scan
       setStep("scanning");
       setStatusLine("Sampling frame for safety check…");
-      setProgress(4);
+      setProgress(3);
       const beforeFrame = await sampleFrameAt(file, 1.0).catch(() => sampleFrameAt(file, 0.2));
-      setProgress(8);
+      setProgress(6);
       const verdict = await checkCopyrightFn({ data: { imageDataUrl: beforeFrame } });
       if (cancelledRef.current) return;
       if (verdict.verdict === "block") {
@@ -318,67 +357,84 @@ function Index() {
       if (verdict.verdict === "warn") {
         setPiracyWarn(verdict.reason || "AI flagged this as possibly copyrighted — proceeding under your declared ownership.");
       }
-      setProgress(14);
+      setProgress(10);
 
-      // 2) Encode to data URL & send to server
+      // 2) Resumable chunked upload to Replicate Files (auto-TTL ~24h)
       setStep("uploading");
-      setStatusLine("Encoding & uploading to GPU…");
-      const dataUrl = await fileToDataURL(file);
-      if (cancelledRef.current) return;
-      setProgress(22);
+      setStatusLine(`Uploading ${fmtBytes(file.size)} in chunks…`);
+      const { sessionId } = await initUploadFn({
+        data: {
+          filename: file.name,
+          contentType: file.type || "video/mp4",
+          totalBytes: file.size,
+        },
+      });
+      const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+      for (let i = 0; i < totalChunks; i++) {
+        if (cancelledRef.current) return;
+        const start = i * CHUNK_SIZE;
+        const end = Math.min(file.size, start + CHUNK_SIZE);
+        const buf = new Uint8Array(await file.slice(start, end).arrayBuffer());
+        const b64 = bytesToBase64(buf);
+        await uploadChunkFn({ data: { sessionId, index: i, chunkBase64: b64 } });
+        const pct = 10 + ((i + 1) / totalChunks) * 15; // 10 → 25
+        setProgress(pct);
+        setStatusLine(`Uploading ${i + 1}/${totalChunks} chunks…`);
+      }
+      const { fileId, url: videoUrl } = await finalizeUploadFn({ data: { sessionId } });
+      uploadedFileIdRef.current = fileId;
+      setProgress(26);
 
+      // 3) Start Real-ESRGAN
+      setStep("queued");
+      setStatusLine("Queueing GPU job…");
       const created = await startEnhanceFn({
-        data: { videoDataUrl: dataUrl, scale, faceEnhance },
+        data: { videoUrl, scale, faceEnhance },
       });
       if (cancelledRef.current) return;
       predIdRef.current = created.id;
       setStatusLine(`Prediction ${created.id.slice(0, 8)} queued`);
-      setProgress(28);
 
-      // 3) Poll
-      setStep("queued");
-      let lastStatus = created.status;
-      let pollProgress = 30;
-      while (true) {
-        if (cancelledRef.current) return;
-        const p = await pollEnhanceFn({ data: { id: created.id } });
-        lastStatus = p.status;
-        setStatusLine(`GPU ${p.status}…`);
+      // Decide phase budgets
+      const willInterpolate = targetFps > 0;
+      const upscaleCeil = willInterpolate ? 70 : 88;
+      const upscaledUrl = await pollUntilDone(created.id, "enhancing", 28, upscaleCeil);
 
-        if (p.status === "processing") setStep("enhancing");
+      // 4) Optional RIFE FPS interpolation
+      let finalUrl = upscaledUrl;
+      if (willInterpolate) {
+        setStep("interpolating");
+        setStatusLine(`Interpolating to ${targetFps} FPS…`);
+        const rife = await startInterpolateFn({
+          data: { videoUrl: upscaledUrl, targetFps },
+        });
+        predIdRef.current = rife.id;
+        finalUrl = await pollUntilDone(rife.id, "interpolating", upscaleCeil, 88);
+      }
 
-        // Smooth fake-progress bar (real % isn't reported by Replicate for video)
-        pollProgress = Math.min(85, pollProgress + 1.2);
-        setProgress(pollProgress);
+      // 5) AI quality audit
+      setStep("auditing");
+      setStatusLine("AI auditing real enhancement…");
+      try {
+        const afterFrame = await sampleFrameFromUrl(finalUrl, 1.0);
+        const a = await verifyEnhancementFn({
+          data: { beforeDataUrl: beforeFrame, afterDataUrl: afterFrame },
+        });
+        setAudit(a);
+      } catch {
+        /* non-fatal */
+      }
 
-        if (p.status === "succeeded") {
-          const out = Array.isArray(p.output) ? p.output[0] : p.output;
-          if (!out || typeof out !== "string") throw new Error("Replicate returned no output URL.");
-          setProgress(88);
+      setOutputUrl(finalUrl);
+      setProgress(100);
+      setStep("done");
+      cleanup();
 
-          // 4) AI quality audit — sample frame from output and compare
-          setStep("auditing");
-          setStatusLine("AI auditing real enhancement…");
-          try {
-            const afterFrame = await sampleFrameFromUrl(out, 1.0);
-            const a = await verifyEnhancementFn({
-              data: { beforeDataUrl: beforeFrame, afterDataUrl: afterFrame },
-            });
-            setAudit(a);
-          } catch {
-            // non-fatal
-          }
-
-          setOutputUrl(out);
-          setProgress(100);
-          setStep("done");
-          cleanup();
-          return;
-        }
-        if (p.status === "failed" || p.status === "canceled") {
-          throw new Error(p.error || `Replicate ${p.status}`);
-        }
-        await new Promise((r) => setTimeout(r, POLL_MS));
+      // 6) Server-side cleanup of uploaded source (TTL belt-and-braces).
+      // Output URL also auto-expires (~1h Replicate-managed).
+      if (uploadedFileIdRef.current) {
+        cleanupFileFn({ data: { fileId: uploadedFileIdRef.current } }).catch(() => {});
+        uploadedFileIdRef.current = null;
       }
     } catch (e) {
       if (cancelledRef.current) return;
@@ -386,6 +442,11 @@ function Index() {
       setError(msg || "Processing failed.");
       setStep("error");
       cleanup();
+      // best-effort cleanup on failure too
+      if (uploadedFileIdRef.current) {
+        cleanupFileFn({ data: { fileId: uploadedFileIdRef.current } }).catch(() => {});
+        uploadedFileIdRef.current = null;
+      }
     }
   };
 
