@@ -4,8 +4,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   abortEnhance,
   checkCopyright,
+  cleanupFile,
+  finalizeUpload,
+  initUpload,
   pollEnhance,
   startEnhance,
+  startInterpolate,
+  uploadChunk,
   verifyEnhancement,
 } from "@/server/enhance.functions";
 
@@ -30,19 +35,21 @@ export const Route = createFileRoute("/")({
 
 type Step =
   | "idle"
-  | "scanning" // anti-piracy AI scan
-  | "uploading" // sending to server
-  | "queued" // Replicate queued
-  | "enhancing" // GPU running
-  | "auditing" // verify watchdog
+  | "scanning"
+  | "uploading"
+  | "queued"
+  | "enhancing"
+  | "interpolating"
+  | "auditing"
   | "done"
   | "error";
 
 const STEPS: { id: Exclude<Step, "idle" | "done" | "error">; label: string }[] = [
-  { id: "scanning", label: "AI Safety Scan" },
-  { id: "uploading", label: "Uploading" },
+  { id: "scanning", label: "AI Scan" },
+  { id: "uploading", label: "Upload" },
   { id: "queued", label: "Queued" },
-  { id: "enhancing", label: "GPU Enhancing" },
+  { id: "enhancing", label: "GPU Upscale" },
+  { id: "interpolating", label: "FPS Boost" },
   { id: "auditing", label: "AI Audit" },
 ];
 
@@ -51,9 +58,16 @@ const SCALE_OPTIONS = [
   { id: 4, label: "4× Ultra", subtitle: "Best quality (~30-60s)" },
 ] as const;
 
-const MAX_FILE_MB = 60; // safe inline upload size for Replicate data URI
-const MAX_PROCESS_MS = 8 * 60 * 1000; // 8-min server-side cap
+const FPS_OPTIONS = [
+  { id: 0, label: "Original FPS", subtitle: "Skip interpolation" },
+  { id: 60, label: "60 FPS", subtitle: "Smooth (~+30s)" },
+  { id: 100, label: "100 FPS", subtitle: "Ultra-smooth (~+60s)" },
+] as const;
+
+const MAX_FILE_MB = 500; // resumable upload cap
+const MAX_PROCESS_MS = 10 * 60 * 1000; // 10-min cap
 const POLL_MS = 1500;
+const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB per chunk
 
 function classNames(...s: (string | false | null | undefined)[]) {
   return s.filter(Boolean).join(" ");
