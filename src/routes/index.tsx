@@ -794,12 +794,24 @@ function Index() {
                     />
                   </div>
                   <div className="mt-2 flex items-center justify-between text-[10px] uppercase tracking-widest text-muted-foreground">
-                    <span>Elapsed {fmtTime(elapsed)} / 8:00 limit</span>
+                    <span>Elapsed {fmtTime(elapsed)} / 10:00 limit</span>
                     {statusLine && (
                       <span className="truncate max-w-[60%] font-mono normal-case tracking-normal text-[10px] opacity-70">{statusLine}</span>
                     )}
                   </div>
                 </div>
+
+                {logTail && isProcessing && (
+                  <div className="mt-3 rounded-md border border-white/10 bg-black/40 p-2">
+                    <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-widest text-muted-foreground">
+                      <span>Live GPU Logs</span>
+                      <span className="h-1.5 w-1.5 rounded-full bg-[#ff0050] pulse-neon" />
+                    </div>
+                    <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-all font-mono text-[10px] leading-tight text-emerald-300/80">
+{logTail.split("\n").slice(-8).join("\n")}
+                    </pre>
+                  </div>
+                )}
 
                 {piracyWarn && (
                   <div className="mt-4 rounded-md border border-yellow-500/30 bg-yellow-500/10 p-3 text-xs text-yellow-200">
