@@ -873,7 +873,7 @@ function Index() {
           <h2 className="font-display text-2xl md:text-3xl">How it works</h2>
           <div className="mt-6 grid gap-4 md:grid-cols-5">
             {[
-              ["Drop", "Pick a clip up to 60MB."],
+              ["Drop", "Pick a clip up to 500MB (resumable upload)."],
               ["AI Scan", "Anti-piracy AI verifies content."],
               ["Upload", "Sent securely to GPU server."],
               ["Real-ESRGAN", "Generative 2-4× upscale on GPU."],
